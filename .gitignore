@@ -1,1 +1,9 @@
-﻿__pycache__/`n*.pyc`n.DS_Store`n
+﻿# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Local-only future-todo scratchpad (NOT pushed to GitHub)
+FUTURE.md

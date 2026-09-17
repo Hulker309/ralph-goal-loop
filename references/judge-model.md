@@ -1,3 +1,10 @@
+> ⚠️ **状态说明(2026-09-17 核对)**:本文是 **v0.1.0 设计文档,不是代码现状**。
+> 文中带 `_stepN_` 前缀的方法名(`_step6_outer_loop` / `_step7_run_batch` / `_step8_evaluate` /
+> `_step4_expand_to_prd` / `_build_story_task` / `_check_file_overlap` / `run_single_story_inline`)
+> 在 `scripts/ralph.py` 里**全部不存在** —— 脚本已改道到另一套命名(`_outer_loop` / `_run_batch` /
+> `_evaluate` / `_step_recon` / `_render_worker_prompt`)。本文保留,作为**设计意图**参考。
+> 要核对真实行为,以 `scripts/ralph.py` 和 `SKILL.md` 为准。
+
 # Judge Model — Routing, Cost & Failure Modes
 
 > 配 `SKILL.md §Cost & Iteration Caps` 段。本文件是它的事实展开:judge 调哪个模型、怎么配、cost 几何、哪 6 个坑必看。

@@ -1,3 +1,10 @@
+> ⚠️ **状态说明(2026-09-17 核对)**:本文是 **v0.1.0 设计文档,不是代码现状**。
+> 文中带 `_stepN_` 前缀的方法名(`_step6_outer_loop` / `_step7_run_batch` / `_step8_evaluate` /
+> `_step4_expand_to_prd` / `_build_story_task` / `_check_file_overlap` / `run_single_story_inline`)
+> 在 `scripts/ralph.py` 里**全部不存在** —— 脚本已改道到另一套命名(`_outer_loop` / `_run_batch` /
+> `_evaluate` / `_step_recon` / `_render_worker_prompt`)。本文保留,作为**设计意图**参考。
+> 要核对真实行为,以 `scripts/ralph.py` 和 `SKILL.md` 为准。
+
 # Batch Strategy — Priority Grouping & delegate_task Fan-out
 
 > 配 `SKILL.md §Priority Grouping & Batch Strategy` 段。本文件是它的事实展开:为什么按 priority 分组、伪代码、1-story 退化、result 解析、文件冲突回避、跨 priority 同步。
@@ -192,7 +199,11 @@ batch = [s for s in pending if s["priority"] == top_priority]
 
 `min(priority)` 保证:**优先级最高的(数值最小的)那一组 story 一定先跑完才开下一 priority**。即使 priority 1 有 5 个 story,priority 2 也要等这 5 个全 `passes=true`。
 
-**容错**:priority 1 中某个 story 跑挂了(`status="failed"`),orchestrator 仍继续跑 priority 2(per `_step8_evaluate` 不因单 story 失败 pause 整个 goal)。这是 design choice:**不要让 priority 1 的局部失败阻塞 priority 2 的好工作**。priority 1 失败的 story 在下一轮 retry(同 priority 内)。
+**容错(⚠️ 本节原描述与实现相反,2026-09-17 核对后改写)**:原设计设想「priority 1 局部失败不阻塞 priority 2」。但 `_outer_loop` 的实际逻辑是每轮取 `min(priority)` 的 pending stories 组一批 —— **只要 priority 1 还有 `passes: false` 的 story,它永远是最小 priority,priority 2 永远不会开始**。
+
+后果是**优先级饥饿**:一个跑不通的 story 会把整个 loop 卡死在那一层,一直空转到 `max_iterations`,后面的优先级再也没机会。这是真实行为,不是本文档原来说的「继续跑下一层」。
+
+要避免饥饿,拆 story 时别让某个 priority 只有「一个难过」的 story 且它的阻塞面很大 —— 或者接受这是设计取舍(阻塞是保守的:宁可卡住也不要带着未完成的依赖往下跑)。
 
 ## 7. 不在范围内
 

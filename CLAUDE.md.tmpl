@@ -1,3 +1,14 @@
+> ⚠️ **状态说明(2026-09-17 核对)**:本文件**当前不被运行时使用**。
+> `scripts/ralph.py` 里对它**零引用**(全仓 grep 无命中)。真正发给 worker 的 prompt 是
+> `_render_worker_prompt()` 现场拼的,比本文件短得多。
+>
+> 本文件的价值在于它比那份 prompt **更细**:它的 `Learnings` 格式
+> (`Pattern:` / `Gotcha:` / `File:`)和「Follow existing code patterns」质量门槛
+> **已移植进 `_render_worker_prompt()`**;其余部分(priority batching 说明、完整 progress
+> entry 模板)保留作**设计参考**。
+>
+> 要改 worker 的行为,**改 `scripts/ralph.py::_render_worker_prompt`**,不是改这里。
+
 # Ralph + Hermes /goal Hybrid Loop — Worker Instructions (TEMPLATE)
 #
 # This is the worker-side prompt template. The orchestrator (`scripts/ralph.py`)

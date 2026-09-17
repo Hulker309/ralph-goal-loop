@@ -15,7 +15,7 @@ Exit codes:
     0  ALL_PASSES / GOAL_DONE       2  MAX_ITERATIONS      3  COST_CAP
     4  USER_REJECTED_CONTRACT / GOAL_BLOCKED
     5  USER_REJECTED_PRD           6  DELEGATION_FAILED   7  GOAL_CLEARED
-    8  INTERNAL_ERROR              9  NO_GOAL
+    8  INTERNAL_ERROR              9  NO_GOAL            10  NO_PROGRESS
 
 Judge routing: by default the orchestrator injects the parent agent's provider/model/base_url
 into ``hermes_cli.goals._call_goal_judge_llm`` for the duration of ``evaluate_after_turn`` so the
@@ -37,6 +37,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 import traceback
@@ -64,6 +65,146 @@ DEFAULT_COST_CAP_USD = 5.0
 # Rough $/1k tokens for main conversation model — used to estimate worker cost.
 _WORKER_IN_USD_PER_1K = 0.003
 _WORKER_OUT_USD_PER_1K = 0.015
+
+# ── Recon: parallel codebase grounding (the missing "head" of the loop) ──────
+# Upstream Ralph grounds interfaces IMPLICITLY: the iteration agent sits inside the project
+# directory and reads real code while it works, so it never has to guess a signature. When
+# execution is delegated to a fan-out of workers, that implicit grounding vanishes — a worker
+# receives only the story text and guesses the interfaces, and the guess surfaces much later
+# as compile errors plus orchestrator rework.
+#
+# Recon restores grounding EXPLICITLY: before execution, N recon workers are fanned out to read
+# the real codebase and rewrite each story's acceptance criteria into verifiable form (real
+# signatures + runnable commands). Recon workers are read-only and never write prd.json — the
+# orchestrator merges their findings per batch, so parallel workers cannot race on shared state.
+_RECON_GROUP_DEFAULT = 3          # stories handed to one recon worker
+_RECON_BLOCK_RE = re.compile(r"<recon>(.*?)</recon>", re.DOTALL)
+
+# ── Parallel batch planning ──────────────────────────────────────────────────
+# Upstream Ralph is strictly serial (one story per iteration) and gets its concurrency from the
+# agent inside that single iteration. Here execution is a fan-out, so parallelism has to be
+# DECIDED — and the caller (the agent driving this skill) decides it, via --parallel-mode:
+#
+#   off       one story per round. Strict serial; upstream fidelity.
+#   priority  group by equal `priority` value (the original behaviour). NOTE: upstream's `ralph`
+#             skill numbers stories 1,2,3… so every story gets its own priority, which makes this
+#             mode serial in practice. Kept for callers that group deliberately.
+#   auto      dependency-aware + file-overlap-aware grouping ACROSS priorities (default). A story
+#             is eligible once its `dependsOn` are all `passes: true`; two stories may share a
+#             batch only when their file sets are known and disjoint. Unknown file set ⇒ the story
+#             runs alone, because an unknown conflict surface is not evidence of no conflict.
+#   manual    respect explicit `parallelGroup` labels written into prd.json, so the caller can
+#             choose the exact grouping (max freedom, no inference).
+_PARALLEL_MODES = ("off", "priority", "auto", "manual")
+_PARALLEL_MODE_DEFAULT = "auto"
+_MAX_PARALLEL_DEFAULT = 10        # matches delegate_task's DaemonThreadPoolExecutor budget
+
+
+def _normalize_path(p: str) -> str:
+    return p.strip().replace("\\", "/").lstrip("./").lower()
+
+
+def _story_files(story: Dict[str, Any]) -> set:
+    """File paths a story is expected to touch.
+
+    Prefers the explicit `files` field on the story, falling back to what recon read off the real
+    codebase. Empty set means "conflict surface unknown" — callers must treat that as a blocker,
+    never as "no conflicts".
+    """
+    out = set()
+    for p in (story.get("files") or []):
+        if isinstance(p, str) and p.strip():
+            out.add(_normalize_path(p))
+        elif isinstance(p, dict) and (p.get("path") or "").strip():
+            out.add(_normalize_path(str(p["path"])))
+    for f in ((story.get("recon") or {}).get("files") or []):
+        p = (f or {}).get("path") if isinstance(f, dict) else f
+        if isinstance(p, str) and p.strip():
+            out.add(_normalize_path(p))
+    return out
+
+
+def _story_deps(story: Dict[str, Any]) -> set:
+    """Story ids this one waits on. Accepts `dependsOn` (camel) or `depends_on` (snake)."""
+    raw = story.get("dependsOn")
+    if raw is None:
+        raw = story.get("depends_on")
+    if isinstance(raw, str):
+        return {raw.strip()} if raw.strip() else set()
+    if isinstance(raw, (list, tuple)):
+        return {str(x).strip() for x in raw if str(x).strip()}
+    return set()
+
+
+def _render_recon_prompt(project_root: str, stories: List[Dict[str, Any]]) -> str:
+    """Build the prompt for one recon worker (grounds a group of stories, writes nothing)."""
+    blocks = []
+    for s in stories:
+        ac = "\n".join(f"    - {a}" for a in (s.get("acceptanceCriteria") or []))
+        blocks.append(
+            f"### {s.get('id', '?')} — {s.get('title', '')}\n"
+            f"    description: {s.get('description', '')}\n"
+            f"    current acceptance criteria (WRITTEN ON PAPER, NEVER CHECKED AGAINST CODE):\n"
+            f"{ac}"
+        )
+    stories_block = "\n\n".join(blocks)
+    return (
+        "# Recon task — ground these stories in the REAL codebase (do NOT write feature code)\n\n"
+        f"Project root: {project_root}\n\n"
+        "## Stories to ground\n\n"
+        f"{stories_block}\n\n"
+        "## Why you are here\n"
+        "Those acceptance criteria were written from a requirements document. Nobody checked them\n"
+        "against the actual code. If the implementer trusts them and guesses the interfaces, the\n"
+        "guess fails at compile time and has to be fixed by hand afterwards. Your job is to find\n"
+        "the truth BEFORE anyone writes code.\n\n"
+        "## Answer these, per story\n"
+        "1. **Which files** will this story create or modify? Give real paths relative to the\n"
+        "   project root, and state whether each exists today.\n"
+        "2. **Real signatures** of every existing interface this story must call. For each: name,\n"
+        "   exact signature, and EVIDENCE as `path:line`. If you cannot find it, write `NOT FOUND`.\n"
+        "3. **Existing conventions** this module follows: export style (named export vs instance\n"
+        "   method vs default), naming, error handling, the build and test commands. Each with evidence.\n"
+        "4. **Traps**: same-name-different-thing, deprecated APIs, implicit types, constraints that\n"
+        "   a typechecker will not catch.\n"
+        "5. **Rewritten acceptance criteria**: rewrite each story's criteria in VERIFIABLE form —\n"
+        "   a command that can be run plus the output that proves it. Cite the real interface names\n"
+        "   you found. Do not write aspiration sentences like \"implement X correctly\".\n\n"
+        "## Hard rules\n"
+        "- READ ONLY. Do not write feature code. Do not modify prd.json or progress.txt.\n"
+        "- EVERY claim needs `path:line` evidence. A claim without evidence is a guess — omit it.\n"
+        "- A missing interface is written `NOT FOUND`. Inventing a plausible-looking signature is\n"
+        "  far more damaging than reporting that it does not exist.\n"
+        "- You may be handed a signature that we ourselves got WRONG earlier. **The code is the\n"
+        "  authority, not our description of it.** If they disagree, report what the code says.\n\n"
+        "## Output format (strict — the orchestrator parses this)\n"
+        "End your reply with exactly one JSON block wrapped in <recon> tags:\n\n"
+        "<recon>\n"
+        '{"stories": [\n'
+        '  {"id": "US-008",\n'
+        '   "files": [{"path": "tools/spawn-bus-session.ts", "exists": false}],\n'
+        '   "interfaces": [{"name": "defineToolPlugin", "signature": "defineToolPlugin<TConfig>(...) -> DefinedToolPluginEntry", "evidence": "plugin-sdk/tool-plugin.d.ts:107"}],\n'
+        '   "conventions": [{"fact": "state modules export top-level functions; getters return plain data with no methods", "evidence": "state/role-registry.ts:37,47"}],\n'
+        '   "gotchas": [{"fact": "import path is plugin-sdk/tool-plugin, NOT plugin-sdk/core", "evidence": "plugin-sdk/tool-plugin.d.ts:107"}],\n'
+        '   "acceptanceCriteria": ["`npx tsc --noEmit` exits 0", "..."]}\n'
+        "]}\n"
+        "</recon>\n"
+    )
+
+
+def _parse_recon_block(text: str) -> Optional[Dict[str, Any]]:
+    """Extract the <recon> JSON block from a recon worker's summary. None if absent/invalid."""
+    m = _RECON_BLOCK_RE.search(text or "")
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw).strip()
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _resolve_judge_overrides(parent_agent: Any, *,
@@ -190,23 +331,83 @@ def _log(progress_path: Path, msg: str) -> None:
     logger.info(msg)
 
 
+def _render_grounding_block(story_id: str, recon: Dict[str, Any]) -> str:
+    """Render a story's recon findings into a prompt block. Empty string when no recon ran."""
+    if not recon:
+        return ""
+    lines = [
+        f"## Grounding for {story_id} — read from the real codebase by a recon pass",
+        "Trust these: each was read out of the code and carries `path:line` evidence.",
+        "If the code disagrees with one, follow the code and report the discrepancy.",
+        "",
+    ]
+    ifs = recon.get("interfaces") or []
+    if ifs:
+        lines.append("**Interfaces (real signatures)**:")
+        for i in ifs:
+            lines.append(f"- `{i.get('name', '?')}` — {i.get('signature', '?')}  "
+                         f"[{i.get('evidence', 'NO EVIDENCE')}]")
+        lines.append("")
+    files = recon.get("files") or []
+    if files:
+        lines.append("**Files this story touches**:")
+        for f in files:
+            state = "exists" if f.get("exists") else "does NOT exist yet"
+            lines.append(f"- `{f.get('path', '?')}` ({state})")
+        lines.append("")
+    for key, label in (("conventions", "**Conventions**"), ("gotchas", "**Traps**")):
+        items = recon.get(key) or []
+        if items:
+            lines.append(f"{label}:")
+            for it in items:
+                lines.append(f"- {it.get('fact', '?')}  [{it.get('evidence', 'NO EVIDENCE')}]")
+            lines.append("")
+    return "\n".join(lines) + "\n"
+
+
 def _render_worker_prompt(prd_path: Path, progress_path: Path,
-                           story: Dict[str, Any]) -> str:
+                           story: Dict[str, Any],
+                           shared_facts: str = "") -> str:
     sid, stitle, sprio = story.get("id", "?"), story.get("title", ""), story.get("priority", 1)
     ac_block = "\n".join(f"- {a}" for a in (story.get("acceptanceCriteria") or []))
+    grounding = _render_grounding_block(sid, story.get("recon") or {})
+    facts_block = ""
+    if shared_facts and shared_facts.strip():
+        facts_block = (
+            "## Facts already established about this codebase\n"
+            "Learned by recon / earlier workers on this same run. Reuse them instead of\n"
+            "rediscovering them; if the code contradicts one, follow the code and report it.\n\n"
+            f"{shared_facts.strip()}\n\n"
+        )
     return (
         f"# Story {sid} — {stitle}\n\n"
         f"**Priority**: {sprio}\n\n"
         f"## Acceptance criteria\n{ac_block}\n\n"
+        f"{grounding}"
+        f"{facts_block}"
         f"## Files\n- prd: {prd_path}\n- progress: {progress_path}\n\n"
         f"## Workflow\n"
         f"1. Read {prd_path}, confirm story {sid} is yours\n"
-        f"2. Read {progress_path} `## Codebase Patterns` section\n"
-        f"3. Implement story {sid}; verify each acceptance criterion command runs OK\n"
-        f"4. Set `passes: true` for story {sid} ONLY in {prd_path}\n"
-        f"5. Append a `## [{sid}]` block to {progress_path}\n"
-        f"6. If ALL stories in {prd_path} have `passes: true`, end your response "
-        f"with the literal token:\n\n{PROMISE_TOKEN}\n")
+        f"2. Read {progress_path} — the `## Grounding` and `## Codebase Patterns` sections first\n"
+        f"3. Read the files you are about to change BEFORE writing; follow the patterns already there\n"
+        f"4. Implement story {sid}; verify each acceptance criterion by running its command\n"
+        f"5. Set `passes: true` for story {sid} ONLY in {prd_path}\n"
+        f"6. Append a `## [{sid}]` block to {progress_path} (append-only; never rewrite earlier blocks)\n"
+        f"7. If ALL stories in {prd_path} have `passes: true`, end your response "
+        f"with the literal token:\n\n{PROMISE_TOKEN}\n\n"
+        f"## Quality bar\n"
+        f"- Do NOT mark `passes: true` without running the verification and pasting its output\n"
+        f"- Do NOT commit broken code\n"
+        f"- Follow the existing code patterns in the files you touch\n"
+        f"- Write real assertions in tests, never placeholder `assert True`\n\n"
+        f"## Report what you learned (the orchestrator merges this into shared state)\n"
+        f"Inside your `## [{sid}]` progress block, include these three lines so the next story does\n"
+        f"not have to rediscover them. Omit a line only if you genuinely found nothing:\n"
+        f"```\n"
+        f"- Pattern: <reusable fact about how this codebase does things, with file:line>\n"
+        f"- Gotcha: <non-obvious trap you hit, with file:line>\n"
+        f"- File: <where X is defined or stored, with path:line>\n"
+        f"```\n")
 
 
 class RalphGoalLoop:
@@ -219,12 +420,37 @@ class RalphGoalLoop:
                  cost_cap_usd: float = DEFAULT_COST_CAP_USD,
                  session_id: Optional[str] = None,
                  auto_draft: bool = True,
-                 judge_overrides: Optional[Dict[str, Any]] = None) -> None:
+                 judge_overrides: Optional[Dict[str, Any]] = None,
+                 recon: bool = True,
+                 recon_group: int = _RECON_GROUP_DEFAULT,
+                 project_root: Optional[str] = None,
+                 worker_provider: Optional[str] = None,
+                 worker_model: Optional[str] = None,
+                 parallel_mode: str = _PARALLEL_MODE_DEFAULT,
+                 max_parallel: int = _MAX_PARALLEL_DEFAULT) -> None:
         self.prd_path = Path(prd_path).resolve()
         self.progress_path = self.prd_path.parent / "progress.txt"
         self.max_iter, self.cost_cap_usd = max_iter, cost_cap_usd
         self.session_id = session_id or f"ralph-{int(time.time())}"
         self.auto_draft = auto_draft
+        # Recon: ground each story's acceptance criteria against the real codebase before any
+        # worker writes code. project_root is the codebase the workers read (usually the repo
+        # root, not the directory holding prd.json).
+        self.recon = recon
+        self.recon_group = max(1, int(recon_group))
+        self.project_root = str(Path(project_root).resolve()) if project_root else os.getcwd()
+        # Worker model. None → inherit config.yaml's model.provider/model.default (what `hermes chat`
+        # uses). Set explicitly to run ralph on a different model than the global default without
+        # editing config.yaml — e.g. when the configured provider is rate-limited or down.
+        self.worker_provider = worker_provider
+        self.worker_model = worker_model
+        # How this round's stories are grouped for parallel fan-out. Validated here so a bad value
+        # fails loudly at construction rather than silently degrading to serial.
+        mode = (parallel_mode or _PARALLEL_MODE_DEFAULT).strip().lower()
+        if mode not in _PARALLEL_MODES:
+            raise ValueError(f"parallel_mode must be one of {_PARALLEL_MODES}, got {parallel_mode!r}")
+        self.parallel_mode = mode
+        self.max_parallel = max(1, int(max_parallel))
         self.cost_so_far_usd: float = 0.0
         self.goal_manager: Optional[GoalManager] = None
         self.contract: Optional[GoalContract] = None
@@ -239,16 +465,14 @@ class RalphGoalLoop:
             from hermes_cli.config import load_config
             from hermes_cli.runtime_provider import resolve_runtime_provider
 
-            # Fix v0.2 bug: AIAgent() with empty kwargs loses model.provider/model
-            # (custom_providers.{base_url,api_key} still load, but model.* is dropped).
-            # Fix v0.3 bug: api_mode is required — without it child posts to /chat/completions
-            # and MiniMax /anthropic endpoint 404s. Resolve via the SAME ladder hermes chat
-            # uses (ladder 2-8 in hermes_cli.runtime_provider.resolve_runtime_provider) so
-            # child inherits the proven-working runtime that lets the main conversation
-            # work end-to-end (no more guessing from base_url suffix).
+            # Provider/model resolution order: --worker-provider/--worker-model, else config.yaml
+            # (the same values `hermes chat` uses). Deliberately NO literal model fallback: baking a
+            # vendor name in here would pin the loop to a model the user never chose and to an
+            # endpoint that may be down, and would make the skill vendor-specific. When nothing is
+            # configured we pass None and let Hermes' own provider ladder decide.
             model_cfg = (load_config().get("model") or {})
-            worker_provider = (model_cfg.get("provider") or "minimax-cn").strip() or "minimax-cn"
-            worker_model = (model_cfg.get("default") or "MiniMax-M3").strip() or "MiniMax-M3"
+            worker_provider = (self.worker_provider or model_cfg.get("provider") or "").strip() or None
+            worker_model = (self.worker_model or model_cfg.get("default") or "").strip() or None
 
             rt = resolve_runtime_provider(
                 requested=worker_provider,
@@ -318,25 +542,280 @@ class RalphGoalLoop:
                 _log(self.progress_path, f"pause/resume exception {exc!r}")
         return True
 
+    # ── Step 5.5: recon — ground the stories against the real codebase ──────
+    def _step_recon(self, prd: Dict[str, Any]) -> Dict[str, Any]:
+        """Fan out recon workers so each story's criteria come out of the real codebase.
+
+        Parallelism is preserved (N recon workers ride in ONE delegate_task batch). All WRITES
+        happen here, after the batch returns, so parallel workers can never race on prd.json.
+
+        Failure is non-fatal on purpose: if recon yields nothing, the loop proceeds exactly as
+        before, and progress.txt records that it ran ungrounded.
+        """
+        if not self.recon:
+            _log(self.progress_path, "recon: disabled (--no-recon)")
+            return prd
+        pending = [s for s in prd.get("userStories", []) if not s.get("passes", False)]
+        if not pending:
+            return prd
+        if not _DELEG_OK or RalphGoalLoop.parent_agent is None:
+            _log(self.progress_path, "recon: skipped — delegate unavailable "
+                                     f"({_DELEG_ERR or RalphGoalLoop.parent_agent_err})")
+            return prd
+
+        groups = [pending[i:i + self.recon_group]
+                  for i in range(0, len(pending), self.recon_group)]
+        _log(self.progress_path,
+             f"recon: {len(pending)} pending stories → {len(groups)} recon workers "
+             f"(group={self.recon_group}) root={self.project_root}")
+        tasks = [{"goal": _render_recon_prompt(self.project_root, g), "context": ""}
+                 for g in groups]
+        try:
+            raw = delegate_task(tasks=tasks, parent_agent=RalphGoalLoop.parent_agent,
+                                background=False)
+            res = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception as exc:
+            _log(self.progress_path, f"recon delegate_task raised {exc!r} → proceed ungrounded")
+            return prd
+
+        results = (res or {}).get("results", []) if isinstance(res, dict) else []
+        merged: Dict[str, Any] = {}
+        unparsed = 0
+        for e in results:
+            tok = e.get("tokens", {}) or {}
+            self.cost_so_far_usd += (int(tok.get("input", 0)) / 1000.0) * _WORKER_IN_USD_PER_1K
+            self.cost_so_far_usd += (int(tok.get("output", 0)) / 1000.0) * _WORKER_OUT_USD_PER_1K
+            parsed = _parse_recon_block(e.get("summary", ""))
+            if not parsed:
+                unparsed += 1
+                continue
+            for st in (parsed.get("stories") or []):
+                if isinstance(st, dict) and st.get("id"):
+                    merged[st["id"]] = st
+        _log(self.progress_path,
+             f"recon: {len(results)} worker(s), unparsed={unparsed}, grounded={len(merged)} story(ies)")
+        if not merged:
+            _log(self.progress_path, "recon: 0 stories grounded → proceeding ungrounded")
+            return prd
+
+        grounded_ac = 0
+        for s in prd.get("userStories", []):
+            r = merged.get(s.get("id"))
+            if not r:
+                continue
+            s["recon"] = r
+            new_ac = [a for a in (r.get("acceptanceCriteria") or [])
+                      if isinstance(a, str) and a.strip()]
+            if new_ac:
+                s["acceptanceCriteria"] = new_ac
+                grounded_ac += 1
+        try:
+            self.prd_path.write_text(json.dumps(prd, indent=2, ensure_ascii=False),
+                                     encoding="utf-8")
+        except Exception as exc:
+            _log(self.progress_path, f"recon: write prd.json FAILED {exc!r}")
+            return prd
+        _log(self.progress_path, f"recon: prd.json grounded — {len(merged)} stories, "
+                                 f"{grounded_ac} got rewritten criteria")
+        self._write_grounding_section(merged)
+        return prd
+
+    def _write_grounding_section(self, merged: Dict[str, Any]) -> None:
+        """Append the recon findings to progress.txt — the shared facts later stories reuse."""
+        lines = ["", "## Grounding (verified against the real codebase by recon)", ""]
+        for sid in sorted(merged):
+            r = merged[sid]
+            lines.append(f"### {sid}")
+            for i in (r.get("interfaces") or []):
+                lines.append(f"- Interface `{i.get('name', '?')}` — {i.get('signature', '?')} "
+                             f"[{i.get('evidence', 'NO EVIDENCE')}]")
+            for f in (r.get("files") or []):
+                state = "exists" if f.get("exists") else "does NOT exist yet"
+                lines.append(f"- File `{f.get('path', '?')}` ({state})")
+            for it in (r.get("conventions") or []):
+                lines.append(f"- Pattern: {it.get('fact', '?')} [{it.get('evidence', 'NO EVIDENCE')}]")
+            for it in (r.get("gotchas") or []):
+                lines.append(f"- Gotcha: {it.get('fact', '?')} [{it.get('evidence', 'NO EVIDENCE')}]")
+            lines.append("")
+        try:
+            with open(self.progress_path, "a", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+        except Exception as exc:
+            _log(self.progress_path, f"grounding section append failed: {exc!r}")
+
+    def _read_shared_facts(self, limit_chars: int = 6000) -> str:
+        """Read back accumulated Grounding + Codebase Patterns so later workers inherit them.
+
+        Both sections are appended to repeatedly over a run, so collect every occurrence.
+        """
+        try:
+            text = self.progress_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+        chunks: List[str] = []
+        for header in ("## Grounding", "## Codebase Patterns"):
+            parts = re.split(rf"^{re.escape(header)}\s*$", text, flags=re.MULTILINE)
+            for part in parts[1:]:
+                nxt = re.search(r"^## ", part, flags=re.MULTILINE)
+                chunk = (part[:nxt.start()] if nxt else part).strip()
+                if chunk:
+                    chunks.append(f"{header}\n{chunk}")
+        if not chunks:
+            return ""
+        out = "\n\n".join(chunks)
+        # Guard against the `[-0:]` slice inversion: in Python `out[-0:]` is `out[0:]`, so a
+        # budget of 0 would return EVERYTHING instead of nothing, and a negative budget would
+        # silently slice from the wrong end. A non-positive budget means "share nothing".
+        if limit_chars <= 0:
+            return ""
+        return out[-limit_chars:] if len(out) > limit_chars else out
+
+    def _merge_learnings(self, batch_result: Dict[str, Any]) -> None:
+        """Consolidate the `Pattern:/Gotcha:/File:` lines workers reported.
+
+        Each worker appends its own `## [US-xxx]` block (append-only, keyed by its own story id,
+        so no race). The consolidated `## Codebase Patterns` section is orchestrator-owned —
+        written once per batch, after the workers have all returned.
+        """
+        found, seen = [], set()
+        for r in (batch_result.get("results") or []):
+            for line in (r.get("summary", "") or "").splitlines():
+                stripped = line.strip().lstrip("-*\u2022 ").strip()
+                for label in ("Pattern:", "Gotcha:", "File:"):
+                    if stripped.startswith(label):
+                        val = stripped[len(label):].strip()
+                        if val and val not in seen:
+                            seen.add(val)
+                            found.append(f"- {label} {val}")
+        if not found:
+            return
+        payload = ["", "## Codebase Patterns", "",
+                   f"(consolidated by the orchestrator from worker reports; {len(found)} fact(s))", ""]
+        payload.extend(found)
+        try:
+            with open(self.progress_path, "a", encoding="utf-8") as fh:
+                fh.write("\n".join(payload) + "\n")
+            _log(self.progress_path,
+                 f"merged {len(found)} learned fact(s) into ## Codebase Patterns")
+        except Exception as exc:
+            _log(self.progress_path, f"learnings merge failed: {exc!r}")
+
+    # ── Batch planning: WHO runs together this round ────────────────────────
+    # The caller picks the strategy (--parallel-mode); the planner only applies it. Every mode is
+    # dependency-aware: a story whose `dependsOn` are not all passed yet is never scheduled.
+    def _plan_batch(self, pending: List[Dict[str, Any]],
+                    passed_ids: set) -> tuple:
+        """Return (batch, reason). An empty batch means nothing is runnable this round."""
+        mode = self.parallel_mode
+        if mode == "off" or self.max_parallel <= 1:
+            one = min(pending, key=lambda s: s.get("priority", 99))
+            return [one], f"mode={mode} (serial)"
+        if mode == "priority":
+            top = min(s.get("priority", 99) for s in pending)
+            batch = [s for s in pending if s.get("priority", 99) == top]
+            return batch[: self.max_parallel], f"mode=priority top={top}"
+        if mode == "manual":
+            return self._plan_manual(pending, passed_ids)
+        return self._plan_auto(pending, passed_ids)
+
+    def _plan_auto(self, pending: List[Dict[str, Any]], passed_ids: set) -> tuple:
+        eligible = [s for s in pending if _story_deps(s) <= passed_ids]
+        if not eligible:
+            return [], self._unrunnable_reason(pending, passed_ids)
+        eligible.sort(key=lambda s: s.get("priority", 99))
+        chosen: List[Dict[str, Any]] = []
+        used: set = set()
+        unknown: List[str] = []
+        for s in eligible:
+            if len(chosen) >= self.max_parallel:
+                break
+            files = _story_files(s)
+            if not files:
+                # Unknown conflict surface ≠ no conflict. Run it alone rather than risk two
+                # workers writing the same file.
+                unknown.append(str(s.get("id", "?")))
+                continue
+            if files & used:
+                continue
+            chosen.append(s)
+            used |= files
+        if not chosen:
+            one = eligible[0]
+            return [one], (f"mode=auto serial — no disjoint pair available "
+                           f"(unknown file set for {unknown[:4] or 'all'})")
+        reason = f"mode=auto batch={len(chosen)}"
+        if unknown:
+            reason += f" deferred_unknown_files={unknown[:4]}"
+        return chosen, reason
+
+    def _plan_manual(self, pending: List[Dict[str, Any]], passed_ids: set) -> tuple:
+        eligible = [s for s in pending if _story_deps(s) <= passed_ids]
+        if not eligible:
+            return [], self._unrunnable_reason(pending, passed_ids)
+        eligible.sort(key=lambda s: s.get("priority", 99))
+        head = eligible[0]
+        key = str(head.get("parallelGroup") or "").strip()
+        if not key:
+            return [head], "mode=manual — no parallelGroup on the head story, running it alone"
+        members = [s for s in eligible
+                   if str(s.get("parallelGroup") or "").strip() == key][: self.max_parallel]
+        # The caller owns the grouping, so an overlap is obeyed — but never silently: two workers
+        # on one file corrupts it with no error, so say so in the log.
+        seen: set = set()
+        clashes = []
+        for s in members:
+            f = _story_files(s)
+            if f & seen:
+                clashes.append(str(s.get("id", "?")))
+            seen |= f
+        reason = f"mode=manual group={key!r} batch={len(members)}"
+        if clashes:
+            reason += f" ⚠ OVERLAPPING_FILES={clashes} — same file may be written twice, in parallel"
+        return members, reason
+
+    def _unrunnable_reason(self, pending: List[Dict[str, Any]], passed_ids: set) -> str:
+        """Explain why nothing is runnable — usually a dependsOn that can never be satisfied."""
+        known = {s.get("id") for s in _read_prd(self.prd_path).get("userStories", [])}
+        bad = {}
+        for s in pending:
+            missing = {d for d in _story_deps(s) if d not in passed_ids}
+            unknown_dep = {d for d in missing if d not in known}
+            if unknown_dep:
+                bad[str(s.get("id", "?"))] = sorted(unknown_dep)
+        if bad:
+            return (f"mode={self.parallel_mode} NOTHING RUNNABLE — dependsOn names stories that do "
+                    f"not exist: {bad}")
+        waiting = {str(s.get("id", "?")): sorted(_story_deps(s) - passed_ids) for s in pending}
+        return (f"mode={self.parallel_mode} NOTHING RUNNABLE — every pending story is waiting on an "
+                f"unpassed dependency: {waiting}")
+
     # ── Step 6: outer loop ──────────────────────────────────────────────────
     def _outer_loop(self) -> str:
         for round_idx in range(self.max_iter):
             prd = _read_prd(self.prd_path)
-            pending = [s for s in prd.get("userStories", []) if not s.get("passes", False)]
+            stories = prd.get("userStories", [])
+            pending = [s for s in stories if not s.get("passes", False)]
             if not pending:
                 _log(self.progress_path, f"round {round_idx + 1}: ALL_PASSES")
                 return "ALL_PASSES"
             if self.goal_manager is not None and not self.goal_manager.is_active():
                 _log(self.progress_path, f"round {round_idx + 1}: goal_manager inactive → GOAL_CLEARED")
                 return "GOAL_CLEARED"
-            top = min(s.get("priority", 99) for s in pending)
-            batch = [s for s in pending if s.get("priority", 99) == top]
+            passed_ids = {s.get("id") for s in stories if s.get("passes", False)}
+            batch, reason = self._plan_batch(pending, passed_ids)
+            if not batch:
+                # Never spin to max_iter on a scheduling deadlock: say why and stop.
+                _log(self.progress_path, f"round {round_idx + 1}: {reason}")
+                return "NO_PROGRESS"
             _log(self.progress_path,
-                 f"round {round_idx + 1}: priority={top} batch_size={len(batch)} "
+                 f"round {round_idx + 1}: {reason} batch_size={len(batch)} "
                  f"stories={[s.get('id', '?') for s in batch]}")
             br = self._run_batch(batch)
             if br.get("status") != "OK":
                 return "DELEGATION_FAILED"
+            # Fold what these workers learned into the shared section, so the next batch inherits it
+            # instead of rediscovering it. Orchestrator-owned → parallel workers never race on it.
+            self._merge_learnings(br)
             ev = self._evaluate(br)
             if ev == "GOAL_DONE":
                 return "GOAL_DONE"
@@ -360,7 +839,11 @@ class RalphGoalLoop:
         if RalphGoalLoop.parent_agent is None:
             _log(self.progress_path, f"parent_agent is None: {RalphGoalLoop.parent_agent_err}")
             return {"status": "DELEGATION_FAILED", "results": []}
-        tasks = [{"goal": _render_worker_prompt(self.prd_path, self.progress_path, s),
+        # Hand each worker everything this run has established so far (recon grounding + facts
+        # merged from earlier batches), so it reuses them instead of rediscovering or re-guessing.
+        shared = self._read_shared_facts()
+        tasks = [{"goal": _render_worker_prompt(self.prd_path, self.progress_path, s,
+                                                shared_facts=shared),
                   "context": ""} for s in batch]
         try:
             raw = delegate_task(tasks=tasks, parent_agent=RalphGoalLoop.parent_agent,
@@ -460,6 +943,10 @@ class RalphGoalLoop:
             self._step_normalize_prd()
             prd2 = _read_prd(self.prd_path)
             self._step_review_prd(prd2)
+            # Ground every story against the real codebase BEFORE any worker writes code. This is
+            # the step upstream Ralph got for free by running each iteration inside the project;
+            # once execution is delegated, it has to be done explicitly or workers guess interfaces.
+            prd2 = self._step_recon(prd2)
             status = self._outer_loop()
             _log(self.progress_path, f"=== end status={status} cost=${self.cost_so_far_usd:.4f}")
             return status
@@ -475,6 +962,7 @@ _STATUS_TO_EXIT = {
     "USER_REJECTED_PRD": 5,
     "DELEGATION_FAILED": 6, "GOAL_CLEARED": 7,
     "INTERNAL_ERROR": 8, "NO_GOAL": 9,
+    "NO_PROGRESS": 10,   # scheduler deadlock: nothing runnable (see _unrunnable_reason)
 }
 
 
@@ -487,6 +975,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--session-id", default=None)
     p.add_argument("--no-draft", action="store_true",
                    help="Skip draft_contract() (boss already wrote prd.json)")
+    p.add_argument("--no-recon", action="store_true",
+                   help="Skip the recon pass — stories keep their paper acceptance criteria")
+    p.add_argument("--recon-group", type=int, default=_RECON_GROUP_DEFAULT,
+                   help=f"Stories per recon worker (default {_RECON_GROUP_DEFAULT})")
+    p.add_argument("--project-root", default=None,
+                   help="Codebase root the workers read (default: current working directory)")
+    p.add_argument("--worker-provider", default=None,
+                   help="Provider for the parent/worker agent (default: config.yaml model.provider)")
+    p.add_argument("--worker-model", default=None,
+                   help="Model for the parent/worker agent (default: config.yaml model.default)")
+    p.add_argument("--parallel-mode", default=_PARALLEL_MODE_DEFAULT, choices=list(_PARALLEL_MODES),
+                   help="How to group stories into a parallel batch (default: "
+                        f"{_PARALLEL_MODE_DEFAULT}). 'off'=one at a time; 'priority'=equal priority; "
+                        "'auto'=dependency+file-overlap aware (needs recon's file info); "
+                        "'manual'=respect each story's parallelGroup label")
+    p.add_argument("--max-parallel", type=int, default=_MAX_PARALLEL_DEFAULT,
+                   help=f"Cap on stories per batch (default {_MAX_PARALLEL_DEFAULT})")
     # Judge routing — inherit from parent_agent (worker provider) by default.
     p.add_argument("--judge-provider", default=None,
                    help="Judge LLM provider (default: inherit from parent agent)")
@@ -505,7 +1010,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Build the orchestrator WITHOUT judge_overrides first so parent_agent is initialized, then
     # derive overrides from it. This keeps parent_agent init order stable across CLI invocations.
     orch = RalphGoalLoop(args.prd, args.max_iter, args.cost_cap,
-                         args.session_id, auto_draft=not args.no_draft)
+                         args.session_id, auto_draft=not args.no_draft,
+                         recon=not args.no_recon, recon_group=args.recon_group,
+                         project_root=args.project_root,
+                         worker_provider=args.worker_provider,
+                         worker_model=args.worker_model,
+                         parallel_mode=args.parallel_mode,
+                         max_parallel=args.max_parallel)
     orch.judge_overrides = _resolve_judge_overrides(
         RalphGoalLoop.parent_agent,
         judge_provider=args.judge_provider,

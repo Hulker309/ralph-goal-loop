@@ -33,6 +33,7 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
@@ -89,6 +90,43 @@ def _stub_draft_and_set(self, goal_text: str):
     return None
 
 
+_recon_seen: List[int] = []
+
+
+def _stub_recon(self, prd: Dict[str, Any]) -> Dict[str, Any]:
+    """Stub the recon pass: it fans out REAL delegate_task workers, i.e. real API calls.
+
+    This test is meant to be offline, so recon must be stubbed like _run_batch. We record the
+    call instead, which also proves run() wires the recon step in.
+    """
+    _recon_seen.append(len(prd.get("userStories", [])))
+    return prd
+
+
+@contextmanager
+def _offline(draft=None, recon=None, batch=None):
+    """Patch every outward-facing seam of run() so a test can drive it without spending money.
+
+    run() fans out real delegate_task workers twice — once for recon, once for the story batch —
+    so a test that stubs only _run_batch still performs paid recon calls. Keeping the seam list
+    in one place means a step added to run() later gets stubbed here once instead of being missed
+    by every caller.
+    """
+    import ralph as _r
+    patches = [
+        patch.object(_r.RalphGoalLoop, "_step_draft_and_set", draft or _stub_draft_and_set),
+        patch.object(_r.RalphGoalLoop, "_step_recon", recon or _stub_recon),
+        patch.object(_r.RalphGoalLoop, "_run_batch", batch or _stub_run_batch),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        yield
+    finally:
+        for p in reversed(patches):
+            p.stop()
+
+
 def _make_decision(verdict: str, **overrides: Any) -> Dict[str, Any]:
     """Synthesize a decision dict mirroring ``_decision()`` in hermes_cli/goals.py:1042."""
     base = {
@@ -125,8 +163,8 @@ def test_minidemo_runs_and_returns(tmp_path: Path, capsys) -> None:
         importlib.reload(sys.modules["ralph"])
     import ralph
 
-    with patch.object(ralph.RalphGoalLoop, "_step_draft_and_set", _stub_draft_and_set), \
-         patch.object(ralph.RalphGoalLoop, "_run_batch", _stub_run_batch):
+    _recon_seen.clear()
+    with _offline():
         orch = ralph.RalphGoalLoop(
             prd_path=str(tmp_path / "prd.json"),
             max_iter=3,
@@ -137,6 +175,7 @@ def test_minidemo_runs_and_returns(tmp_path: Path, capsys) -> None:
         status = orch.run()
 
     progress = (tmp_path / "progress.txt").read_text(encoding="utf-8")
+    assert _recon_seen == [1], f"run() must call _step_recon exactly once, saw {_recon_seen}"
     assert "=== start" in progress, f"missing start marker in:\n{progress}"
     assert "REVIEW_NEEDED: PRD" in progress, f"missing PRD review marker in:\n{progress}"
     assert "round 1:" in progress, f"missing round 1 log in:\n{progress}"
@@ -310,8 +349,7 @@ def test_outer_loop_propagates_goal_blocked() -> None:
             "duration_seconds": 0.1,
         }]}
 
-    with patch.object(ralph.RalphGoalLoop, "_step_draft_and_set", _stub_draft), \
-         patch.object(ralph.RalphGoalLoop, "_run_batch", _stub_batch):
+    with _offline(draft=_stub_draft, batch=_stub_batch):
         status = orch.run()
     assert status == "GOAL_BLOCKED", f"GOAL_BLOCKED should short-circuit, got {status}"
     # verify outer loop only ran ONCE (no second iteration where MAX_ITERATIONS would fire)
