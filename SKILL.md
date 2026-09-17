@@ -217,13 +217,13 @@ hermes goal clear        # 删 goal state
 | `max_iterations` | 10 | ✅ 硬卡 | 立即 abort,留 progress.txt 痕迹 |
 | `max_budget_usd` | 5.0 | ✅ 硬卡 | 立即 abort,留 progress.txt 痕迹 |
 | `goal.max_turns`(`config.yaml::auxiliary.goal_judge.max_turns` 或 `goals.max_turns`) | 20(走 `/goal` 默认) | ✅ 硬卡 | judge fail 兜底,见 Caveats |
-| judge LLM 选哪个 | **默认走主对话模型**(同 worker world-view) | 软 | 老板可在 `config.yaml::auxiliary.goal_judge.{provider,model}` 改 |
+| judge LLM 选哪个 | **走 `resolve_runtime_provider()` ladder**(同 `hermes chat` 一条路径) | 软 | 老板可在 `config.yaml::auxiliary.goal_judge.{provider,model}` 改,或 CLI `--judge-{provider,model,base-url,api-key-env}` 覆盖 |
 
-**judge model 设计意图**(默认主对话 + 允许覆盖):
+**judge model 设计意图**(走 `resolve_runtime_provider()` ladder + 允许覆盖):
 
-> **Default**: judge LLM uses the SAME model as the worker (the main conversation model). Rationale: 当 judge 跟 worker 是同一个模型时,它们共享同一个"worldview"——同套 domain knowledge,同套"什么算 done"直觉。不同模型 judge 可能在边界情况下不同意,不是 work 错,而是 default 不同。
+> **Default (v0.3)**: judge 走 `hermes_cli.runtime_provider.resolve_runtime_provider()` ladder 拿完整 runtime(provider/model/base_url/api_key/api_mode),跟 `hermes chat` 同一条路径——避免 base_url 后缀推断 + api_mode 缺失导致的 endpoint 404。`scripts/ralph.py:234-265` `_init_parent_agent` 调它构造 parent agent,judge override 链路(`_resolve_judge_overrides` + `_judge_call_overrides_ctx`,`scripts/ralph.py:69-170`)继承 parent 的 runtime 后再覆盖。Rationale: 当 judge 跟 worker 是同一个模型时,它们共享同一个"worldview"——同套 domain knowledge,同套"什么算 done"直觉。不同模型 judge 可能在边界情况下不同意,不是 work 错,而是 default 不同。
 >
-> **User override**: set `auxiliary.goal_judge` in config.yaml to route the judge to a different model. The `/goal` engine + `agent.auxiliary_client.call_llm` already supports this routing — 本 skill 不加新机制。
+> **User override**: set `auxiliary.goal_judge` in config.yaml to route the judge to a different model, **或** CLI 启动时传 `--judge-provider X --judge-model Y --judge-base-url Z --judge-api-key-env ENV_VAR`。CLI flag 优先级高于 config(`/goal` engine + `agent.auxiliary_client.call_llm` + 本 skill 的 `_judge_call_overrides_ctx` 一起支持,不动 hermes-agent)。
 >
 > Example overrides:
 > ```yaml
@@ -234,6 +234,18 @@ hermes goal clear        # 删 goal state
 >     timeout: 10
 >     max_tokens: 500
 > ```
+> 或 CLI:
+> ```bash
+> hermes ralph --prd ./prd.json \
+>   --judge-provider openrouter --judge-model google/gemini-3-flash-preview \
+>   --judge-keep-aux-config   # 反向:无视 CLI,继续用 auxiliary.goal_judge 配置
+> ```
+
+> **v0.3 fix (相对 v0.2 的 bug 修复,影响 judge 路由)**:
+> - **症状**:v0.2 `AIAgent()` 空 kwargs 构造 parent,丢了 `model.provider/model`,judge 调用继承到 broken runtime(典型:`MiniMax-M3` + `/anthropic` 后缀但 api_mode 缺失,POST 到 `/chat/completions` 404)。
+> - **修法**:v0.3 `scripts/ralph.py:234-265` `_init_parent_agent` 调 `resolve_runtime_provider(requested=provider, target_model=model)`,拿完整 5 元组(provider/model/base_url/api_key/api_mode)再构造 `AIAgent(...)`,跟 `hermes chat` ladder 2-8 同源。
+> - **验证**:`hermes ralph` 实跑本机 `Desktop/hermes-ralph-goal-loop-test/` 3-story prd,judge call 走 parent 同一 endpoint,无 404。
+> - **回退路径**:老 config `auxiliary.goal_judge.*` 仍然受 `_resolve_task_provider_model` 路由;用 CLI `--judge-keep-aux-config` 反向锁住老行为。
 >
 > **Failure mode**: if `auxiliary.goal_judge` is configured but the call fails (network, auth, rate-limit), `/goal` official behavior is **fail-OPEN** — the judge returns `("continue", ...)` and the turn budget is the backstop. 本 skill 继承。
 >
@@ -272,6 +284,7 @@ worker 实施完所有自己 story 后,**必须**在 response 末尾 echo litera
 7. **退化成"借外部 Claude Code 跑"** — fork 进程 30 秒 exit,失去 Hermes 自己的 cache 边界 + cost 路径;**mitigation**: 本 skill description 第一句写明 "0 external CLI, 100% Hermes in-process"
 8. **`auxiliary.goal_judge` 配错** — 老板配了一个不存在的 provider/model,judge call 静默 fail,主循环退化成"一直 continue"直到 max_iterations;**mitigation**: orchestrator 启动时 sanity check `goal_judge_setting()` 返回有效值,无效就 warn 但不 abort
 9. **paused 状态被外部改** — 老板中途 `/goal clear`,orchestrator 还不知道,继续跑下一轮;**mitigation**: orchestrator 每轮 `goal_manager.is_active()` 校验,not active → abort 报 `GOAL_CLEARED`
+10. **v0.2→v0.3 进化: `api_mode` 缺失会让 child POST 到错 endpoint** — 旧版 `AIAgent()` 空 kwargs 构造 parent,丢了 `model.provider/model` + `api_mode`,child judge / delegate 走 `auxiliary_client.call_llm` 时 POST 到 `/chat/completions`,但 MiniMax `base_url` 后缀是 `/anthropic` 或 v1 路径 → 404 or 401。**mitigation (v0.3 已修)**: `scripts/ralph.py:240-265` `_init_parent_agent` 调 `hermes_cli.runtime_provider.resolve_runtime_provider(requested=provider, target_model=model)`,拿完整 5 元组(`provider/model/base_url/api_key/api_mode`)再构造 `AIAgent(...)`,跟 `hermes chat` ladder 2-8 同源。CLI 启动时仍可 `--judge-keep-aux-config` 锁回老 `auxiliary.goal_judge.*` 路由,见 Pitfall #8。
 
 ## Verification Checklist
 
@@ -288,7 +301,7 @@ worker 实施完所有自己 story 后,**必须**在 response 末尾 echo litera
 - [ ] `agent/prompt_builder.py` / `tools/delegate_tool.py` / `DELEGATE_BLOCKED_TOOLS` 三件套 0 改动(不变量)
 - [ ] `metadata.hermes.related_skills` 引用了 `kanban-codex-lane` + `openclaw-plugin-author-suite` + `hermes-agent`
 - [ ] cost cap 真的生效 — 把 `max_budget_usd` 设成 $0.01,跑一个会超的 prd,验证立即 abort 不继续
-- [ ] judge LLM 走 `auxiliary.goal_judge` 路由真的生效 — 配 OpenRouter Gemini Flash,跑 1 轮 judge,看 `~/.hermes/logs/` 里 judge call 的 model 字段
+- [ ] judge LLM 两条路径都没真调过: (a) `auxiliary.goal_judge.*` config 路由 + (b) CLI `--judge-{provider,model,base-url,api-key-env}` 覆盖 path——2 条 path 各自的 judge call model 字段未在 `~/.hermes/logs/` 里端到端验过(注:`resolve_runtime_provider()` ladder 本身已被 `hermes chat` 验证,见 §Not verified)
 - [ ] negative test:故意写 1 个 story 的 acceptance criteria 错(比如 `assert 1==2`),验证子 agent 标 `passes=false` 不退出,主 skill 进入下一轮 retry 直到 max_iterations
 
 ## References
@@ -312,8 +325,9 @@ worker 实施完所有自己 story 后,**必须**在 response 末尾 echo litera
 
 ## Not verified(诚实交代)
 
-- 0 step 2 的 `goal_manager.set(goal_text, contract=contract)` 在老板的 v0.21.3 + 已 update 的环境下是否真能传 `contract` 形参(`GoalManager.set` line 1132 标了 `contract: Optional[GoalContract] = None`,但没在 v0.21.3 实跑过 `set(..., contract=...)`)
+- ✅ ~~step 2 的 `goal_manager.set(goal_text, contract=contract)`~~ 在 v0.21.3 实跑过 — `scripts/test_minidemo.py` 5/5 PASSED,`goal_manager.set(goal_text, contract=contract)` 路径工作正常
 - 0 step 5 的 `delegate_task(tasks=[...])` 在 `hermes chat` 外(纯 `hermes ralph` CLI 模式)是否能调通(`hermes_agent` 必传 `parent_agent=self`,CLI 模式下 orchestrator 没有 `parent_agent` 怎么处理——可能要走 `AIAgent(...)` 自己构造再传)
 - 0 sub-agent 报告说 `DELEGATE_BLOCKED_TOOLS = {delegate_task, clarify, memory, send_message, cronjob_manage}`,这是从 `tools/delegate_tool_toolsets.py:14` 读出来的;但**实际的阻塞是在 child agent 收到 task 时 filter tools,不是 child 的 toolset 里没有**,这条对 worker 写 prd.json 不构成阻碍,但 precision 仍待 Phase 3 实测验
 - 0 judge LLM 的具体 token 消耗 + 主模型 judge vs Gemini Flash judge 实际质量差(per `/goal` 官方说 ~200 token,Phase 3 实测验)
 - 0 跨 priority batch 间的"等上一组全 passes=true 才开下一组"——这个 orchestrator 逻辑本 skill 自己实现,`/goal` 不管 priority。Phase 3 实测验
+- 0 `resolve_runtime_provider()` ladder 本身端到端验证 — v0.3 fix 信任 `hermes chat` ladder 2-8 的现成行为(老板 v0.21.3 实跑 `hermes chat` 通过),ralph 端单独不重测;若未来 ladder 上游变了,需重新跑 `scripts/test_minidemo.py` 验证 `_init_parent_agent` 仍能拿到完整 5 元组
