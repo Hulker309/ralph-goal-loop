@@ -16,6 +16,7 @@ Exit codes:
     4  USER_REJECTED_CONTRACT / GOAL_BLOCKED
     5  USER_REJECTED_PRD           6  DELEGATION_FAILED   7  GOAL_CLEARED
     8  INTERNAL_ERROR              9  NO_GOAL            10  NO_PROGRESS
+   11  STORIES_EXHAUSTED (remaining stories are unreachable: benched, or dependsOn is dead)
 
 Judge routing: by default the orchestrator injects the parent agent's provider/model/base_url
 into ``hermes_cli.goals._call_goal_judge_llm`` for the duration of ``evaluate_after_turn`` so the
@@ -98,6 +99,17 @@ _RECON_BLOCK_RE = re.compile(r"<recon>(.*?)</recon>", re.DOTALL)
 _PARALLEL_MODES = ("off", "priority", "auto", "manual")
 _PARALLEL_MODE_DEFAULT = "auto"
 _MAX_PARALLEL_DEFAULT = 10        # matches delegate_task's DaemonThreadPoolExecutor budget
+
+# ── Failure handling / starvation guard ──────────────────────────────────────
+# A story that is dispatched and still comes back `passes: false` has spent a full attempt. Left
+# unbounded, one unsatisfiable story owns the whole run: it stays pending forever, so in the old
+# `min(priority)` grouping it also blocked every story behind it until max_iterations burned out.
+# Correct behaviour is to BENCH it after N failed attempts and keep the run productive on the
+# stories that can still finish, then report what was benched and why.
+#
+# Priority is an ORDERING preference, never a gate: `dependsOn` decides what may run, priority
+# only decides what to reach for first. 0 disables benching (retry forever, the old behaviour).
+_MAX_STORY_ATTEMPTS_DEFAULT = 3
 
 
 def _normalize_path(p: str) -> str:
@@ -427,7 +439,8 @@ class RalphGoalLoop:
                  worker_provider: Optional[str] = None,
                  worker_model: Optional[str] = None,
                  parallel_mode: str = _PARALLEL_MODE_DEFAULT,
-                 max_parallel: int = _MAX_PARALLEL_DEFAULT) -> None:
+                 max_parallel: int = _MAX_PARALLEL_DEFAULT,
+                 max_story_attempts: int = _MAX_STORY_ATTEMPTS_DEFAULT) -> None:
         self.prd_path = Path(prd_path).resolve()
         self.progress_path = self.prd_path.parent / "progress.txt"
         self.max_iter, self.cost_cap_usd = max_iter, cost_cap_usd
@@ -451,6 +464,12 @@ class RalphGoalLoop:
             raise ValueError(f"parallel_mode must be one of {_PARALLEL_MODES}, got {parallel_mode!r}")
         self.parallel_mode = mode
         self.max_parallel = max(1, int(max_parallel))
+        # Failure bookkeeping. In-memory is authoritative for scheduling: prd.json is rewritten by
+        # workers (they flip their own `passes`), so a counter stored there could be clobbered.
+        # Attempt counts are mirrored into progress.txt for humans; a fresh process starts over.
+        self.max_story_attempts = int(max_story_attempts)
+        self.attempts: Dict[str, int] = {}
+        self.benched: set = set()
         self.cost_so_far_usd: float = 0.0
         self.goal_manager: Optional[GoalManager] = None
         self.contract: Optional[GoalContract] = None
@@ -789,6 +808,80 @@ class RalphGoalLoop:
         return (f"mode={self.parallel_mode} NOTHING RUNNABLE — every pending story is waiting on an "
                 f"unpassed dependency: {waiting}")
 
+    def _dead_stories(self, stories: List[Dict[str, Any]],
+                      pending: List[Dict[str, Any]]) -> Dict[str, str]:
+        """Map every story id that can NEVER run → the reason, propagated to a fixpoint.
+
+        Two ways a story becomes unreachable: it was benched after repeated failure, or it waits
+        on something that can never finish (a `dependsOn` naming a story that does not exist in
+        the prd, or one that is itself dead). The second case matters: without propagating, a
+        story behind a benched story is retried-forever-in-its-own-way and the loop limps to
+        max_iterations instead of stopping with an accurate account.
+        """
+        all_ids = {str(s.get("id", "?")) for s in stories}
+        reasons: Dict[str, str] = {
+            sid: f"benched after {self.attempts.get(sid, 0)} failed attempt(s)"
+            for sid in self.benched
+        }
+        changed = True
+        while changed:
+            changed = False
+            for s in pending:
+                sid = str(s.get("id", "?"))
+                if sid in reasons:
+                    continue
+                deps = {str(d) for d in _story_deps(s)}
+                ghosts = sorted(d for d in deps if d not in all_ids)
+                if ghosts:
+                    reasons[sid] = f"dependsOn names non-existent story(ies) {ghosts}"
+                    changed = True
+                    continue
+                dead_deps = sorted(d for d in deps if d in reasons)
+                if dead_deps:
+                    reasons[sid] = f"waiting on unreachable {dead_deps}"
+                    changed = True
+        return reasons
+
+    def _record_attempts(self, batch: List[Dict[str, Any]]) -> None:
+        """Charge one attempt to every dispatched story still not `passes: true`; bench at the cap.
+
+        Called once per round, after the batch has fully returned (delegate_task is blocking, so
+        by then every worker has stopped writing and the prd.json we read is stable).
+        """
+        if self.max_story_attempts <= 0:
+            return
+        try:
+            prd = _read_prd(self.prd_path)
+        except Exception as exc:
+            _log(self.progress_path, f"attempt bookkeeping skipped — prd.json unreadable: {exc!r}")
+            return
+        state = {str(s.get("id", "?")): bool(s.get("passes", False))
+                 for s in prd.get("userStories", [])}
+        for s in batch:
+            sid = str(s.get("id", "?"))
+            if state.get(sid, False):
+                continue                      # it passed; no attempt to charge
+            n = self.attempts.get(sid, 0) + 1
+            self.attempts[sid] = n
+            if n >= self.max_story_attempts and sid not in self.benched:
+                self.benched.add(sid)
+                _log(self.progress_path,
+                     f"BENCHED {sid} after {n} failed attempt(s) (cap="
+                     f"{self.max_story_attempts}) — skipping it from here so the remaining "
+                     f"stories can still finish")
+            else:
+                _log(self.progress_path,
+                     f"attempt {n}/{self.max_story_attempts} failed for {sid}")
+
+    def _exhausted_report(self, pending: List[Dict[str, Any]],
+                          dead: Dict[str, str]) -> str:
+        """One-line account of why the run has nothing left to do."""
+        parts = [f"NOTHING LEFT TO RUN — {len(dead)} of {len(pending)} pending story(ies) are "
+                 f"unreachable"]
+        for sid in sorted(dead):
+            parts.append(f"{sid}: {dead[sid]}")
+        return " | ".join(parts)
+
     # ── Step 6: outer loop ──────────────────────────────────────────────────
     def _outer_loop(self) -> str:
         for round_idx in range(self.max_iter):
@@ -801,8 +894,22 @@ class RalphGoalLoop:
             if self.goal_manager is not None and not self.goal_manager.is_active():
                 _log(self.progress_path, f"round {round_idx + 1}: goal_manager inactive → GOAL_CLEARED")
                 return "GOAL_CLEARED"
-            passed_ids = {s.get("id") for s in stories if s.get("passes", False)}
-            batch, reason = self._plan_batch(pending, passed_ids)
+            passed_ids = {str(s.get("id")) for s in stories if s.get("passes", False)}
+            # Priority orders candidates; it never gates them. What can run is decided by
+            # dependsOn, and stories that can never finish are excluded so one broken story
+            # cannot starve the rest of the prd.
+            dead = self._dead_stories(stories, pending)
+            runnable = [s for s in pending if str(s.get("id", "?")) not in dead]
+            if not runnable:
+                _log(self.progress_path,
+                     f"round {round_idx + 1}: STORIES_EXHAUSTED — "
+                     f"{self._exhausted_report(pending, dead)}")
+                return "STORIES_EXHAUSTED"
+            if dead:
+                _log(self.progress_path,
+                     f"round {round_idx + 1}: skipping {sorted(dead)} "
+                     f"({len(runnable)} story(ies) still runnable)")
+            batch, reason = self._plan_batch(runnable, passed_ids)
             if not batch:
                 # Never spin to max_iter on a scheduling deadlock: say why and stop.
                 _log(self.progress_path, f"round {round_idx + 1}: {reason}")
@@ -813,6 +920,9 @@ class RalphGoalLoop:
             br = self._run_batch(batch)
             if br.get("status") != "OK":
                 return "DELEGATION_FAILED"
+            # Charge an attempt to whatever did not come back green, benching at the cap. Done
+            # after the batch has fully returned, so no worker is still writing prd.json.
+            self._record_attempts(batch)
             # Fold what these workers learned into the shared section, so the next batch inherits it
             # instead of rediscovering it. Orchestrator-owned → parallel workers never race on it.
             self._merge_learnings(br)
@@ -963,6 +1073,7 @@ _STATUS_TO_EXIT = {
     "DELEGATION_FAILED": 6, "GOAL_CLEARED": 7,
     "INTERNAL_ERROR": 8, "NO_GOAL": 9,
     "NO_PROGRESS": 10,   # scheduler deadlock: nothing runnable (see _unrunnable_reason)
+    "STORIES_EXHAUSTED": 11,   # remaining stories are unreachable (benched / dead dependsOn)
 }
 
 
@@ -992,6 +1103,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "'manual'=respect each story's parallelGroup label")
     p.add_argument("--max-parallel", type=int, default=_MAX_PARALLEL_DEFAULT,
                    help=f"Cap on stories per batch (default {_MAX_PARALLEL_DEFAULT})")
+    p.add_argument("--max-story-attempts", type=int, default=_MAX_STORY_ATTEMPTS_DEFAULT,
+                   help="Bench a story after this many failed attempts so it stops blocking the "
+                        f"rest of the prd (default {_MAX_STORY_ATTEMPTS_DEFAULT}; 0 = never bench)")
     # Judge routing — inherit from parent_agent (worker provider) by default.
     p.add_argument("--judge-provider", default=None,
                    help="Judge LLM provider (default: inherit from parent agent)")
@@ -1016,7 +1130,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                          worker_provider=args.worker_provider,
                          worker_model=args.worker_model,
                          parallel_mode=args.parallel_mode,
-                         max_parallel=args.max_parallel)
+                         max_parallel=args.max_parallel,
+                         max_story_attempts=args.max_story_attempts)
     orch.judge_overrides = _resolve_judge_overrides(
         RalphGoalLoop.parent_agent,
         judge_provider=args.judge_provider,

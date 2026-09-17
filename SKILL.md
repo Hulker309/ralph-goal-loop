@@ -1,11 +1,17 @@
 ---
 name: ralph-goal-loop
 description: "Use when you have a prd.json with multiple user stories and want a single Hermes process to implement them in priority order with parallel fan-out within each priority level. Wraps Hermes /goal (judge + state persistence) as the execution engine and delegate_task batch mode for parallel worker fan-out with a caller-chosen grouping strategy (--parallel-mode off|priority|auto|manual), plus a read-only **recon** pass that grounds each story's acceptance criteria against the real codebase before any worker runs. 0 external CLI, 100% Hermes in-process. Triggers on: 'run ralph', 'multi-story prd', 'goal + fan-out', 'prd.json 拆 story', 'per priority 跑'."
-version: 0.3.0
+version: 0.4.0
 author: Hermes Agent (希尔, 2026-09-17)
 license: MIT
 platforms: [linux, macos, windows]
 changelog:
+  - v0.4.0 — **修掉优先级饥饿**。priority 从「硬闸」改成「排序偏好」:能不能跑只由 `dependsOn` 决定,
+    priority 只决定先够哪个,不再拦后面的层。失败处理独立成一条规则:派出去仍 `passes: false` 的 story
+    记一次尝试,满 `--max-story-attempts`(默认 3)后**下场(bench)**,其余 story 继续推进。依赖链上
+    的坏死故事用传递闭包识别。终止状态拆成三个:`NO_PROGRESS`(10,活死锁,如依赖成环)与
+    `STORIES_EXHAUSTED`(11,死故事,附谁死了/为什么),都不再空转到 `MAX_ITERATIONS`。
+    旧行为的代价:一个跑不通的 story 让整个 prd 空转,预算全烧在重试它上。
   - v0.3.0 — 三件事。① **并行真的能发生了**:批量分组从写死的 `min(priority)` 改成调用方可选的
     `--parallel-mode off|priority|auto|manual`,默认 `auto` 按 `dependsOn` + 文件重叠(用 recon 读到的
     文件)跨 priority 分组;文件未知的 story 单独跑,依赖不可满足时立刻返回 `NO_PROGRESS` 而不是空转。
@@ -93,7 +99,7 @@ Do NOT use `ralph-goal-loop` when:
 | mode | 行为 | 什么时候用 |
 |---|---|---|
 | `off` | 一轮一个 story,严格串行 | 想要上游保真 / 排查问题时 |
-| `priority` | `priority` 数值相同的进同一批 | 你自己按编号分组时(注意:上游 `ralph` skill 的编号习惯是每个 story 一个号 ⇒ 这个模式实际会退化成串行) |
+| `priority` | `priority` 数值相同的进同一批 | 你自己按编号分组时。注意上游 `ralph` skill 的编号习惯是每个 story 一个号 ⇒ 这个模式实际会退化成串行(但失败下场机制仍在,所以卡住的那个会被 bench,后续层能开跑) |
 | **`auto`(默认)** | 跨 priority 分组,依据 **`dependsOn` + 文件重叠** | 一般情况。**前提是 recon 跑过**(文件信息来自 recon) |
 | `manual` | 按 story 上的 `parallelGroup` 标签分组 | 你要精确控制分组、不要任何推断时 |
 
@@ -107,7 +113,29 @@ Do NOT use `ralph-goal-loop` when:
 
 **`--max-parallel N`**(默认 10)对所有模式生效,也是并发上限。
 
-**死锁不硬转**:如果某个 story 的 `dependsOn` 指向一个不存在的 id,它会永远不 eligible。这时 loop 不空转到 `max_iterations`,而是**立刻退出并返回 `NO_PROGRESS`(exit 10)**,`progress.txt` 里写明是哪个 story 在等哪个不存在的依赖。
+### priority 管顺序,`dependsOn` 管资格,失败管下场
+
+这是本 skill 对「优先级饥饿」的修正。三条规则分开,职责不重叠:
+
+| 维度 | 谁负责 |
+|---|---|
+| **能不能跑** | **`dependsOn`** —— 唯一真正的约束 |
+| **先跑哪个** | **`priority`** —— 只是排序偏好,**不拦路**。priority 3 的 story 在 priority 1 还没过时也可以跑(只要依赖满足、文件不冲突) |
+| **跑不通怎么办** | **`--max-story-attempts`(默认 3)** —— 派出去但没变成 `passes: true` 就记一次失败,满 N 次**下场(bench)**,不再派给它,其余 story 继续推进 |
+
+**为什么必须这样**:旧的 `min(priority)` 是硬闸 —— 低数值那一层没过,后面每一层永远轮不到。叠加上游「每个 story 一个号」的编号习惯,一个跑不通的 story 就能让整个 prd 空转到 `max_iterations`,**预算全烧在重试同一个 story 上,别的 story 一次都没试过**。现在它最多花 N 次尝试的代价,然后被隔离,run 继续产出。
+
+`--max-story-attempts 0` = 关闭下场机制,永远重试(旧行为,给想要的人留的)。
+
+### 终止状态(三种,不混用)
+
+| 状态 | exit | 含义 |
+|---|---|---|
+| `ALL_PASSES` | 0 | 全部 story 过了 |
+| `NO_PROGRESS` | 10 | **活死锁**:story 都在,但当下没一个可跑(典型是 `dependsOn` 成环)。**立刻退,不空转** |
+| `STORIES_EXHAUSTED` | 11 | **死故事**:剩下的 story 已经不可能跑完 —— 被 bench 了,或依赖链上有不存在的 id / 已 bench 的 story(传递闭包识别)。**报告谁死了、为什么** |
+
+两种情况都写进 `progress.txt`(`NOTHING RUNNABLE ...` / `NOTHING LEFT TO RUN ...`),不会让你面对一个光秃秃的 `MAX_ITERATIONS`。
 
 **prd.json 可选字段**(全部向后兼容,不写就是旧行为):
 
@@ -115,7 +143,7 @@ Do NOT use `ralph-goal-loop` when:
 {
   "id": "US-008",
   "priority": 8,
-  "dependsOn": ["US-001", "US-003"],   // 可选:等这些 story 过了才能开跑
+  "dependsOn": ["US-001", "US-003"],   // 可选:等这些 story 过了才能开跑(唯一的硬约束)
   "files": ["tools/x.ts", "state/y.ts"], // 可选:显式声明会碰的文件(auto 用它判重叠)
   "parallelGroup": "g1"                  // 可选:manual 模式下按这个标签分组
 }
@@ -269,6 +297,7 @@ orchestrator 在整批返回后统一合并,写入 prd.json + progress.txt
 | `--worker-model NAME` | `config.yaml::model.default` | **换模型**跑本 loop。例:`--worker-provider <p> --worker-model <m>`(用你环境里真有的值) |
 | `--parallel-mode MODE` | `auto` | 并行分组策略:`off` / `priority` / `auto` / `manual`(见 §Parallelism) |
 | `--max-parallel N` | 10 | 单批 story 数上限,也是并发上限 |
+| `--max-story-attempts N` | 3 | story 失败几次后下场(隔离),让其余 story 继续跑;`0` = 不隔离 |
 
 **recon 失败不致命**:拿不到东西就照原样跑,只在 `progress.txt` 留痕(`recon: ... proceeding ungrounded`)。刻意如此——补课环节不该变成新的故障点。
 
@@ -483,7 +512,7 @@ worker 实施完所有自己 story 后,**必须**在 response 末尾 echo litera
 ## Pitfalls
 
 1. **让 worker 改 prd.json 后没回传 `<promise>COMPLETE</promise>`** — Ralph 协议靠这个 grep 退出,worker 漏写 = 主循环死锁;**mitigation**: `CLAUDE.md` worker prompt 模板必须强制要求"完成后 MUST echo 此 token",orchestrator 也用 `judge_goal` 软判定兜底
-2. **并行要么不触发、要么撞文件** — 旧的 `min(priority)` 分组有个双向坑:story 各自独占 priority 时(上游 `ralph` skill 的默认编号习惯)**一批只有一个 story,并行一次都不发生**;而如果为了并行把不相关的 story 硬塞进一批,**两个 worker 可能同时写同一个文件 → 静默损坏**。**mitigation**:`--parallel-mode auto`(默认)用「依赖 + 文件重叠」判定,只把**已知不冲突**的 story 放同批,文件未知的单独跑;重叠判定依赖 recon 的 `files`。
+2. **并行要么不触发、要么撞文件;卡住的那个还堵死后面全部(三个坑均已修)** — 旧 `min(priority)` 分组:(a) story 各自独占 priority 时(上游 `ralph` 的编号习惯)**每批只有 1 个,并行从不触发**;(b) 为了并行把不相关的 story 硬塞一批 → **两个 worker 同时写同一文件 → 静默损坏**;(c) 一个跑不通的 story 永远是最小 priority → **后面每一层永远轮不到**,一路空转到 `max_iterations`。**mitigation**:`--parallel-mode auto`(默认)按「依赖 + 文件重叠」分组,只把**已知不冲突**的放同批,文件未知的单独跑(重叠判定用 recon 的 `files`);失败满 `--max-story-attempts` 次后 bench,不再堵路。见 §Parallelism。
 3. **子 agent 期望 `skip_memory` 透传** — `delegate_task` 根本没有这个 kwarg,`skip_memory=True` 在 `tools/delegate_tool.py:240` 硬编码到 child AIAgent 构造;**mitigation**: orchestrator 入口**不传** `skip_memory`,等价于"已自动开启"
 4. **`max_budget_usd` 没硬卡** — 单 loop 没界,cost spike 跑飞;**mitigation**: orchestrator 启动时校验,超出立即 abort 不 retry(不留中间状态)
 5. **`delegate_task` 只有 1 个 task 时不并发** — batch mode 只在 `len(tasks) >= 2` 时启用(`tools/async_delegation.py` 的 `_executor`)。**这是预期行为,不是缺陷** —— 但要注意它的后果:**如果 prd.json 里每个 story 独占一个 priority,N 恒等于 1,整个 loop 完全串行,并行一次都不会发生**。并行不是免费的,它要求你在拆 story 时**把互不冲突的 story 放进同一个 priority**。
@@ -505,7 +534,9 @@ worker 实施完所有自己 story 后,**必须**在 response 末尾 echo litera
 - [ ] `python scripts/ralph.py --help` 显示正确帮助(含 `--recon` / `--recon-group` / `--project-root` / `--parallel-mode` / `--max-parallel`)
 - [ ] **并行真的发生了** — 跑一个同 priority 或文件不重叠的多 story prd,`progress.txt` 里应出现 `round 1: mode=auto batch=N`(N>=2)。若一直 `batch=1`,查两件事:story 之间是否文件重叠,以及 recon 是否真的跑过(没有文件信息只能串行)
 - [ ] **依赖被尊重** — 给一个 story 写 `dependsOn`,确认它在依赖 `passes: true` 之前不进任何一批
-- [ ] **死锁不空转** — 把某个 `dependsOn` 写成不存在的 id,确认立刻返回 `NO_PROGRESS`(exit 10)而不是跑满 `max_iterations`
+- [ ] **死锁/坏死都不空转** — 把某个 `dependsOn` 写成不存在的 id → 立刻 `STORIES_EXHAUSTED`(exit 11)并点名那个 id;把两个 story 的 `dependsOn` 互指成环 → 立刻 `NO_PROGRESS`(exit 10)。两者都不跑满 `max_iterations`
+- [ ] **卡住的 story 不拖累别的** — 故意写一个永远过不了的 story(比如验收标准是 `assert 1==2`)放在 priority 1,确认:它重试到 `--max-story-attempts` 后被 BENCH,`progress.txt` 出现 `BENCHED <id>`,**且后面 priority 的 story 照样跑完**;整个 run 不是空转到 `max_iterations`
+- [ ] **priority 不再拦路** — 一个 priority 1 的 story 还没过时,priority 2 的 story 只要依赖满足、文件不冲突就应能进同一批(auto 模式)
 - [ ] 实跑本机 `C:/Users/Administrator/Desktop/hermes-ralph-goal-loop-test/` 的 3-story prd.json,验证:
   - [ ] 至少 3 轮迭代(每 priority 1 轮)
   - [ ] prd.json 全部 `passes: true` 后进程退出

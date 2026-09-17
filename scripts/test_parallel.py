@@ -185,7 +185,14 @@ class DeadlockTests(unittest.TestCase):
             self.assertIn("GHOST", reason)
             self.assertIn("NOTHING RUNNABLE", reason)
 
-    def test_outer_loop_returns_no_progress_instead_of_spinning(self):
+    def test_outer_loop_stops_with_a_reason_instead_of_spinning(self):
+        """A dependsOn that can never be satisfied must end the run with an account of why.
+
+        Behaviour change (2026-09-17): this used to surface as the generic NO_PROGRESS. A
+        non-existent dependency is knowably dead, so it is now reported as STORIES_EXHAUSTED and
+        named. NO_PROGRESS is reserved for a *live* deadlock (a dependency cycle), where the
+        stories exist and might yet resolve — see test_starvation.py.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             stories = [_story("A", 1, files=["a.py"], deps=["GHOST"])]
             orch = _orch(tmp, stories, mode="auto")
@@ -194,8 +201,25 @@ class DeadlockTests(unittest.TestCase):
             with patch.object(ralph.RalphGoalLoop, "_run_batch",
                               lambda self, b: calls.append(b) or {"status": "OK", "results": []}):
                 status = orch._outer_loop()
-            self.assertEqual(status, "NO_PROGRESS")
+            self.assertEqual(status, "STORIES_EXHAUSTED")
             self.assertEqual(calls, [], "no worker may be spawned when nothing is runnable")
+            prog = (Path(tmp) / "progress.txt").read_text(encoding="utf-8")
+            self.assertIn("GHOST", prog)
+            self.assertIn("NOTHING LEFT TO RUN", prog)
+
+    def test_outer_loop_reports_a_dependency_cycle_as_no_progress(self):
+        """A cycle is a live deadlock: every story exists, none can be satisfied now."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stories = [_story("A", 1, files=["a.py"], deps=["B"]),
+                       _story("B", 2, files=["b.py"], deps=["A"])]
+            orch = _orch(tmp, stories, mode="auto")
+            orch.max_iter = 50
+            calls = []
+            with patch.object(ralph.RalphGoalLoop, "_run_batch",
+                              lambda self, b: calls.append(b) or {"status": "OK", "results": []}):
+                status = orch._outer_loop()
+            self.assertEqual(status, "NO_PROGRESS")
+            self.assertEqual(calls, [])
             prog = (Path(tmp) / "progress.txt").read_text(encoding="utf-8")
             self.assertIn("NOTHING RUNNABLE", prog)
 

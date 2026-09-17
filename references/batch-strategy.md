@@ -197,13 +197,22 @@ batch = [s for s in pending if s["priority"] == top_priority]
 # 这一行就是跨 priority 同步点: 每轮只挑 1 个 priority 的 batch
 ```
 
-`min(priority)` 保证:**优先级最高的(数值最小的)那一组 story 一定先跑完才开下一 priority**。即使 priority 1 有 5 个 story,priority 2 也要等这 5 个全 `passes=true`。
+**⚠️ 这一节描述的 `min(priority)` 硬闸已被替换(2026-09-17)。** 原来它保证「数值最小的那一组 story 全 `passes=true` 才开下一个 priority」——听起来保守稳妥,实际上是两个陷阱:
 
-**容错(⚠️ 本节原描述与实现相反,2026-09-17 核对后改写)**:原设计设想「priority 1 局部失败不阻塞 priority 2」。但 `_outer_loop` 的实际逻辑是每轮取 `min(priority)` 的 pending stories 组一批 —— **只要 priority 1 还有 `passes: false` 的 story,它永远是最小 priority,priority 2 永远不会开始**。
+- **它是饥饿源头。** 只要 priority 1 还剩一个 `passes: false` 的 story,它永远是最小 priority,**后面每一层永远轮不到**。一个跑不通的 story 会把整个 loop 卡死,空转到 `max_iterations`。
+- **它和上游编号习惯冲突。** 上层 `ralph` skill 的规则是「Priority: 基于依赖顺序,然后文档顺序」,即 **1,2,3… 每个 story 一个号**。喂给这个编号习惯,每批只有 1 个 story —— 并行从不触发。
 
-后果是**优先级饥饿**:一个跑不通的 story 会把整个 loop 卡死在那一层,一直空转到 `max_iterations`,后面的优先级再也没机会。这是真实行为,不是本文档原来说的「继续跑下一层」。
+**现在的正确逻辑**(详见 SKILL.md §Parallelism):
 
-要避免饥饿,拆 story 时别让某个 priority 只有「一个难过」的 story 且它的阻塞面很大 —— 或者接受这是设计取舍(阻塞是保守的:宁可卡住也不要带着未完成的依赖往下跑)。
+| 维度 | 旧 | 新 |
+|---|---|---|
+| priority 的作用 | **硬闸** —— 低数值没过,高数值永不开跑 | **排序偏好** —— 只决定先够哪个,不拦路 |
+| 什么在拦路 | priority 数值 | **`dependsOn`**(真约束才拦) |
+| 跑不通的 story | 无限重试,堵死后面全部 | 重试到 `max_story_attempts` 后**下场(bench)**,其余 story 继续推进 |
+| 依赖前面垫底 | 没人查 | 传递闭包识别并**报告**出来 |
+| 终止 | 空转到 `MAX_ITERATIONS`,无解释 | 无可跑时立刻退,**`STORIES_EXHAUSTED`(exit 11)**,说明谁死了、为什么 |
+
+一句话:**priority 管顺序,`dependsOn` 管资格,失败管下场。**
 
 ## 7. 不在范围内
 
