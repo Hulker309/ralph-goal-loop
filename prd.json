@@ -8,7 +8,7 @@
       "title": "Refactor scripts/ralph.py into RalphCore + HermesAdapter split",
       "priority": 1,
       "dependsOn": [],
-      "passes": false,
+      "passes": true,
       "acceptanceCriteria": [
         "Create scripts/core/ directory with __init__.py, prd.py, progress.py, promise.py, orchestrator.py",
         "Create scripts/adapters/ directory with __init__.py, base.py, hermes.py",
@@ -29,8 +29,10 @@
       "id": "US-002",
       "title": "Implement HermesAdapter using AIAgent.run_conversation",
       "priority": 1,
-      "dependsOn": ["US-001"],
-      "passes": false,
+      "dependsOn": [
+        "US-001"
+      ],
+      "passes": true,
       "acceptanceCriteria": [
         "HermesAdapter.__init__() constructs one AIAgent(session_id='ralph-<int(time.time())>', quiet_mode=True, model=<from config or flag>, provider=<from config or flag>)",
         "run_orchestrator_turn(prompt, history) calls agent.run_conversation(user_message=prompt, conversation_history=history) and returns dict {message, tool_calls, tokens}",
@@ -47,8 +49,10 @@
       "id": "US-003",
       "title": "Drop /goal integration from orchestrator",
       "priority": 1,
-      "dependsOn": ["US-001"],
-      "passes": false,
+      "dependsOn": [
+        "US-001"
+      ],
+      "passes": true,
       "acceptanceCriteria": [
         "RalphGoalLoop.__init__ no longer accepts auto_draft, judge_overrides, or constructs GoalManager",
         "_step_draft_and_set deleted",
@@ -65,8 +69,10 @@
       "id": "US-004",
       "title": "Drop recon pass",
       "priority": 2,
-      "dependsOn": ["US-003"],
-      "passes": false,
+      "dependsOn": [
+        "US-003"
+      ],
+      "passes": true,
       "acceptanceCriteria": [
         "_step_recon, _render_recon_prompt, _parse_recon_block, _write_grounding_section, _RECON_BLOCK_RE, _RECON_GROUP_DEFAULT all deleted from ralph.py",
         "--no-recon, --recon-group flags removed from argparse",
@@ -82,8 +88,10 @@
       "id": "US-005",
       "title": "Update CLI surface to match new architecture",
       "priority": 1,
-      "dependsOn": ["US-001"],
-      "passes": false,
+      "dependsOn": [
+        "US-001"
+      ],
+      "passes": true,
       "acceptanceCriteria": [
         "python scripts/ralph.py --help shows: --prd PATH (required), --max-iter N (default 10), --cost-cap USD (default 5.0), --project-root PATH (default cwd), --worker-provider NAME (default config.yaml model.provider), --worker-model NAME (default config.yaml model.default), --parallel-mode {off,priority,auto,manual} (default auto), --max-parallel N (default 10), --max-story-attempts N (default 3; 0 = never bench)",
         "Removed flags produce argparse error: --no-draft, --no-recon, --recon-group, --session-id, --judge-provider, --judge-model, --judge-base-url, --judge-api-key-env, --judge-keep-aux-config",
@@ -97,8 +105,10 @@
       "id": "US-006",
       "title": "Preserve v0.4.0 starvation fix (dependsOn, priority, benching)",
       "priority": 2,
-      "dependsOn": ["US-001"],
-      "passes": false,
+      "dependsOn": [
+        "US-001"
+      ],
+      "passes": true,
       "acceptanceCriteria": [
         "_plan_auto, _plan_manual, _plan_priority, _plan_off keep their v0.4.0 semantics",
         "dependsOn (camel) and depends_on (snake) both accepted via _story_deps",
@@ -114,8 +124,10 @@
       "id": "US-007",
       "title": "Preserve v0.3.0 parallelism planner",
       "priority": 2,
-      "dependsOn": ["US-001"],
-      "passes": false,
+      "dependsOn": [
+        "US-001"
+      ],
+      "passes": true,
       "acceptanceCriteria": [
         "--parallel-mode auto groups by dependsOn + file overlap; unknown file set ⇒ story runs alone",
         "--parallel-mode manual respects parallelGroup field on stories",
@@ -131,8 +143,10 @@
       "id": "US-008",
       "title": "Rename statuses; update exit-code mapping",
       "priority": 2,
-      "dependsOn": ["US-003"],
-      "passes": false,
+      "dependsOn": [
+        "US-003"
+      ],
+      "passes": true,
       "acceptanceCriteria": [
         "GOAL_DONE renamed to ALL_PASSES (already existed, but is now the only completion signal besides <promise>-driven exit)",
         "GOAL_CLEARED renamed to RUN_PAUSED (boss paused the background process; boss resumes by re-running with the same --prd)",
@@ -150,8 +164,10 @@
       "id": "US-009",
       "title": "Reorganize tests under scripts/tests/",
       "priority": 3,
-      "dependsOn": ["US-001"],
-      "passes": false,
+      "dependsOn": [
+        "US-001"
+      ],
+      "passes": true,
       "acceptanceCriteria": [
         "Create scripts/tests/ directory",
         "Move scripts/test_minidemo.py → scripts/tests/test_minidemo.py",
@@ -169,8 +185,11 @@
       "id": "US-010",
       "title": "Update SKILL.md to reflect new architecture",
       "priority": 3,
-      "dependsOn": ["US-004", "US-008"],
-      "passes": false,
+      "dependsOn": [
+        "US-004",
+        "US-008"
+      ],
+      "passes": true,
       "acceptanceCriteria": [
         "§Overview rewritten: orchestrator is 'persistent AIAgent + PlatformAdapter' not '/goal engine'",
         "§Two-Layer Model rewritten: 'outer iteration loop (RalphCore, pure Python) + inner per-story agent (HermesAdapter)'. Drop the comparison table that mentions /goal judge.",
@@ -191,8 +210,10 @@
       "id": "US-011",
       "title": "Update docs/ARCHITECTURE.md",
       "priority": 3,
-      "dependsOn": ["US-010"],
-      "passes": false,
+      "dependsOn": [
+        "US-010"
+      ],
+      "passes": true,
       "acceptanceCriteria": [
         "§Background: keep Ralph Wiggum original design description",
         "§Why we needed 2 layers (existing): rewrite — we now need 1 layer (RalphCore) + 1 platform-specific adapter, not 'outer Ralph + inner /goal'",
@@ -205,8 +226,10 @@
       "id": "US-012",
       "title": "Update README.md and README.en.md",
       "priority": 3,
-      "dependsOn": ["US-005"],
-      "passes": false,
+      "dependsOn": [
+        "US-005"
+      ],
+      "passes": true,
       "acceptanceCriteria": [
         "§Quickstart updated: example invocation shows only --prd, --project-root, --max-iter",
         "§CLI Reference: only the v1.0 flags listed in US-005",
@@ -219,8 +242,10 @@
       "id": "US-013",
       "title": "Add OpenCLAWAdapter stub",
       "priority": 4,
-      "dependsOn": ["US-002"],
-      "passes": false,
+      "dependsOn": [
+        "US-002"
+      ],
+      "passes": true,
       "acceptanceCriteria": [
         "Create scripts/adapters/openclaw.py with OpenCLAWAdapter(PlatformAdapter) whose four methods all raise NotImplementedError('OpenCLAW adapter TODO — see PRD US-013')",
         "Class docstring describes what the adapter would need to implement: an OpenCLAW agent run loop, a way to detect <promise> in its output, a way to persist conversation history across OpenCLAW sessions",
@@ -232,8 +257,11 @@
       "id": "US-014",
       "title": "End-to-end smoke test with a 3-story prd",
       "priority": 4,
-      "dependsOn": ["US-002", "US-008"],
-      "passes": false,
+      "dependsOn": [
+        "US-002",
+        "US-008"
+      ],
+      "passes": true,
       "acceptanceCriteria": [
         "Create examples/three-stories/prd.json with 3 stories: each story creates one trivial file and echoes a marker",
         "Run python scripts/ralph.py --prd examples/three-stories/prd.json --project-root examples/three-stories to completion",
@@ -248,8 +276,10 @@
       "id": "US-015",
       "title": "Verify equivalence with upstream Ralph on a real project",
       "priority": 5,
-      "dependsOn": ["US-014"],
-      "passes": false,
+      "dependsOn": [
+        "US-014"
+      ],
+      "passes": true,
       "acceptanceCriteria": [
         "Pick a project (suggest: desktop/hermes-ralph-goal-loop-test/ fixture if still present, or another small project)",
         "Run upstream mikeyobrien/ralph on that project's prd.json; capture prd.json end state + progress.txt final contents",
