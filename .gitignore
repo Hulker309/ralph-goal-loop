@@ -7,3 +7,10 @@ __pycache__/
 
 # Local-only future-todo scratchpad (NOT pushed to GitHub)
 FUTURE.md
+
+# Ralph harness scratch state (CLAUDE.md / ralph.sh / progress.txt / .claude/)
+# These are Ralph's run-time artifacts — re-created per Ralph invocation.
+CLAUDE.md
+ralph.sh
+progress.txt
+.claude/

@@ -1,0 +1,55 @@
+{
+  "branchName": "ralph-goal-loop/v1.0-smoke-test",
+  "title": "Three-story smoke test",
+  "description": "Minimal 3-story prd to validate ralph-goal-loop end-to-end.",
+  "userStories": [
+    {
+      "id": "US-1",
+      "title": "Create hello.py",
+      "priority": 1,
+      "passes": true,
+      "dependsOn": [],
+      "files": [
+        "hello.py"
+      ],
+      "acceptanceCriteria": [
+        "File hello.py exists at the fixture root",
+        "hello.py defines greet() returning \"Hello, World!\"",
+        "Running python hello.py exits 0"
+      ]
+    },
+    {
+      "id": "US-2",
+      "title": "Create goodbye.py",
+      "priority": 2,
+      "passes": true,
+      "dependsOn": [],
+      "files": [
+        "goodbye.py"
+      ],
+      "acceptanceCriteria": [
+        "File goodbye.py exists at the fixture root",
+        "goodbye.py defines farewell() returning \"Goodbye!\"",
+        "Running python goodbye.py exits 0"
+      ]
+    },
+    {
+      "id": "US-3",
+      "title": "Create status.py",
+      "priority": 3,
+      "passes": false,
+      "dependsOn": [
+        "US-1",
+        "US-2"
+      ],
+      "files": [
+        "status.py"
+      ],
+      "acceptanceCriteria": [
+        "File status.py exists at the fixture root",
+        "status.py imports and calls greet() and farewell()",
+        "Running python status.py exits 0 and prints both messages"
+      ]
+    }
+  ]
+}
