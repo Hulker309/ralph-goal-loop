@@ -119,6 +119,7 @@ def main(argv: Optional[list] = None) -> int:
             adapter = HermesAdapter(
                 provider=args.worker_provider,
                 model=args.worker_model,
+                project_root=args.project_root,
             )
         elif args.platform == "openclaw":
             adapter = _OpenCLAWAdapter(

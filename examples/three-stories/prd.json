@@ -7,7 +7,7 @@
       "id": "US-1",
       "title": "Create hello.py",
       "priority": 1,
-      "passes": true,
+      "passes": false,
       "dependsOn": [],
       "files": [
         "hello.py"
@@ -22,7 +22,7 @@
       "id": "US-2",
       "title": "Create goodbye.py",
       "priority": 2,
-      "passes": true,
+      "passes": false,
       "dependsOn": [],
       "files": [
         "goodbye.py"

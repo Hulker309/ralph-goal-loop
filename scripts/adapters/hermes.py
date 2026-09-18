@@ -55,6 +55,7 @@ class HermesAdapter:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         api_mode: Optional[str] = None,
+        project_root: Optional[str] = None,
     ) -> None:
         if not _HERMES_OK:
             raise RuntimeError(
@@ -79,6 +80,11 @@ class HermesAdapter:
         self._resolved_api_key = rt.get("api_key") or api_key
         self._resolved_api_mode = rt.get("api_mode") or api_mode
 
+        # project_root is the cwd the agent runs in — equivalent to upstream Ralph's
+        # `cd $PROJECT_ROOT && claude --prompt-file CLAUDE.md`. The agent reads prd.json,
+        # progress.txt, and the real project files relative to this cwd.
+        self.project_root = str(project_root) if project_root else None
+
         self.agent = AIAgent(
             session_id=self.session_id,
             quiet_mode=self.quiet_mode,
@@ -87,6 +93,7 @@ class HermesAdapter:
             base_url=self._resolved_base_url,
             api_key=self._resolved_api_key,
             api_mode=self._resolved_api_mode,
+            cwd=self.project_root,
         )
 
         # Load prior history if this is a resume
