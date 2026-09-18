@@ -1,11 +1,12 @@
 ---
 name: ralph-goal-loop
-description: "Use when you have a prd.json with multiple user stories and want a single Hermes process to implement them in priority order with parallel fan-out within each priority level. Wraps Hermes /goal (judge + state persistence) as the execution engine and delegate_task batch mode for parallel worker fan-out with a caller-chosen grouping strategy (--parallel-mode off|priority|auto|manual). 0 external CLI, 100% Hermes in-process. Triggers on: 'run ralph', 'multi-story prd', 'goal + fan-out', 'prd.json 拆 story', 'per priority 跑'."
-version: 0.4.0
-author: Hermes Agent (希尔, 2026-09-17)
+description: "Use when you have a prd.json with multiple user stories and want a single Hermes Python process to implement them in priority + dependsOn order via a persistent AIAgent, exiting only when every story is `passes: true` (signaled by the literal `<promise>COMPLETE</promise>` token). Pure-Python RalphCore (orchestrator + prd/progress/promise) plus a thin PlatformAdapter layer (HermesAdapter concrete + OpenCLAWAdapter stub). v1.0 drops v0.4's Hermes /goal engine, judge LLM, recon worker, and delegate_task fan-out — a true fidelity port of mikeyobrien/ralph. 0 external CLI, 0 modify hermes-agent core, 100% Hermes in-process. Triggers on: 'run ralph', 'multi-story prd', 'per priority 跑', 'prd.json loop'."
+version: 1.0.0
+author: Hermes Agent (希尔, 2026-09-18)
 license: MIT
 platforms: [linux, macos, windows]
 changelog:
+  - v1.0.0 — **True-fidelity port of mikeyobrien/ralph.** Decompose `scripts/ralph.py` into `scripts/core/` (pure-Python RalphCore: orchestrator/prd/progress/promise) + `scripts/adapters/` (PlatformAdapter abstract + HermesAdapter concrete using AIAgent.run_conversation + OpenCLAWAdapter TODO stub). Drop Hermes `/goal` engine, judge LLM, recon worker, and `delegate_task` fan-out. New architecture uses a single persistent AIAgent session for the entire run — equivalent to upstream Ralph's `cd $PROJECT_ROOT && claude --prompt-file CLAUDE.md`. Statuses renamed: GOAL_DONE→ALL_PASSES, GOAL_CLEARED→RUN_PAUSED. End-to-end smoke test on examples/three-stories/ passes 3/3 in ~2 minutes. 39/39 unit tests pass (test_starvation 15/15 + test_parallel 24/24).
   - v0.4.0 — **修掉优先级饥饿**。priority 从「硬闸」改成「排序偏好」:能不能跑只由 `dependsOn` 决定,
     priority 只决定先够哪个,不再拦后面的层。失败处理独立成一条规则:派出去仍 `passes: false` 的 story
     记一次尝试,满 `--max-story-attempts`(默认 3)后**下场(bench)**,其余 story 继续推进。依赖链上
@@ -23,11 +24,11 @@ changelog:
     此前 SKILL.md 与 references/ 描述的是 v0.1.0 设计,其中有多个函数名(`expand_contract_to_prd` /
     `_step4_expand_to_prd` / `_check_file_overlap` 等)在 `scripts/ralph.py` 里并不存在;
     `hermes ralph` 这个入口从未实现(实现它需要改 hermes-agent 核心,与本 skill 的 0-modify 承诺矛盾);
-    CLAUDE.md.tmpl 零引用(现标注为设计参考)。(Note: recon 已于 v1.0 移除,见 §Dropped mechanisms)
+    CLAUDE.md.tmpl 零引用(现标注为设计参考)。
   - v0.1.0 — 初版:复刻 Ralph 的执行段(外层串行 + 同 priority 内 fan-out + judge + `<promise>` 协议)。
 metadata:
   hermes:
-    tags: [ralph, prd, goal, autonomous-agents, fan-out, delegate_task, multi-story]
+    tags: [ralph, prd, autonomous-agents, multi-story, single-agent, persistent-session]
     related_skills:
       - kanban-codex-lane
       - openclaw-plugin-author-suite
@@ -36,7 +37,7 @@ metadata:
 
 # ralph-goal-loop
 
-> **白话先**: 你有一个 `prd.json` 拆好的多 story 任务,想让它**在 Hermes 自己内部**跑完——按 priority 顺序、同 priority 内 fan-out 并行,直到全部 `passes: true` 才退。**不**调外部 Claude Code CLI,不走 bash 循环,直接用 Hermes 自己的 `/goal` 引擎(judge LLM + state 持久化)做"持续跑到目标完成",用 `delegate_task` batch mode 做"同 priority 内并行 fan-out"。**这是 mikeyobrien/ralph 在 Hermes 内的复刻;底层引擎是 Hermes 官方 `/goal` 而非自造**。
+> **白话先**: 你有一个 `prd.json` 拆好的多 story 任务,想让它**在 Hermes 自己的进程里**跑完——按 priority + `dependsOn` 顺序,直到全部 `passes: true` 才退。Ralph 通过**单个持久 `AIAgent` 实例**读 prd.json + progress.txt + 真实项目代码,自己决定每个 story 怎么做、怎么验证、怎么写入 `passes: true`。**不**调外部 Claude Code CLI,**不走** bash 循环,**不用** Hermes `/goal` 引擎、judge LLM、recon worker 或 `delegate_task` subagent。完成协议:worker 在 response 末尾 echo literal `<promise>COMPLETE</promise>`,orchestrator 用 `detect_promise()` 字符串检测。**这是 mikeyobrien/ralph 在 Hermes 内的真实形态复刻,不是 re-design**。
 
 ## Overview
 
@@ -56,13 +57,13 @@ Use `ralph-goal-loop` when:
 - story 之间有**priority 依赖**(priority 2 必须等 priority 1 全 passes=true)
 - 同 priority 的 story 是**独立的**(可以并行跑,无文件冲突)
 - 你想要**进程内 fan-out**——多 worker 在同 turn 跑,避免串行等 30 秒/轮
-- 你想要**judge LLM 软判定**——主模型或 cheap model 看完 worker 报告判"继续/完成"
+- 你想要**judge LLM 软判定**——v1.0 没有 judge,`<promise>` 字符串检测是唯一完成信号
 
 Do NOT use `ralph-goal-loop` when:
 - 只有 1 个 story(或 1 个 goal 字符串)——直接用 Hermes `/goal`,不需要这层包装
 - story 互不依赖,但你想要**跨机器并行**——用 Kanban + 多 profile,不是 ralph-goal-loop
-- 你想"持续优化到目标完成"但不知道中间要做什么——用 `/goal draft`,让 auxiliary LLM 帮你拆
 - 你想用外部 Claude Code CLI 跑——那是 mikeyobrien/ralph 原版,本 skill 故意不接
+- 你需要 LLM 软判定("这堆 story 是否算完成")——v1.0 只有硬 `<promise>` 协议
 
 ## Two-Layer Model(关键设计)
 
@@ -234,19 +235,18 @@ python scripts/ralph.py --prd ./prd.json --project-root . \
 }
 ```
 
-**GoalContract 字段 vs prd.json 字段** 对位(本 skill 借 `/goal` 的契约思想,套到 Ralph schema 上):
+**GoalContract 字段 vs prd.json 字段** —— v1.0 不再用 GoalContract / draft_contract。Hermes `/goal` 引擎在 v1.0 完全不参与。Ralph 只用 prd.json 的字段:
 
-| `/goal` `GoalContract` 字段 | prd.json 对位 | 用途 |
+| 概念 | prd.json 对位 | 谁维护 |
 |---|---|---|
-| `objective` | `title` + `description` | 高层目标 |
-| `verification` | `acceptanceCriteria[]` 总和 | "什么叫 done" |
-| `constraints` | (无对位,写到 worker prompt) | 边界条件 |
-| `boundaries` | (无对位,写到 worker prompt) | 不要做啥 |
-| `stop_when` | `passes: true` 全部为 true | 终止协议 |
-| (n/a) | `priority` | 跨 story 排序(超出 `/goal` 原生范围) |
-| (n/a) | `passes: bool` | orchestrator 维护的中间状态 |
-
-`GoalManager` 不知道 `priority`——`/goal` 原生是单 goal 反复跑,**`priority` 是本 skill orchestrator 维护的额外维度**。这正是 `ralph-goal-loop` 跟 `/goal` 的边界:本 skill 接管 story 编排,`/goal` 接管 judge 引擎。
+| 高层目标 | `title` + `description` | 老板写 |
+| "什么叫 done" | `acceptanceCriteria[]` | 老板写 |
+| 完成协议 | `passes: true` 全部为 true + worker echo `<promise>COMPLETE</promise>` | orchestrator 维护 |
+| 边界条件 | (写到 worker prompt) | adapter._render_worker_prompt |
+| 跨 story 排序 | `priority` | orchestrator 维护 |
+| 依赖 | `dependsOn` / `depends_on` | orchestrator 维护 |
+| 文件重叠(供 auto mode) | `files` | 老板写或 recon 自动发现(v1.0 没用 recon,只能手写) |
+| 手工分组(manual mode) | `parallelGroup` | 老板写 |
 
 ## Monitoring & Kill Behavior
 
@@ -331,15 +331,18 @@ worker 实施完所有 story 后,**必须**在 response 末尾 echo literal toke
 - ❌ 跨 profile 跑(本 skill 只在自己 profile 跑;跨 profile 走 Kanban)
 - ❌ 跨机器并行(走 Kanban + 多 profile gateway,不是 ralph-goal-loop)
 - ❌ 修改 `hermes-agent/` 核心任何文件(本 skill 纯新增)
-- ❌ 替代 Hermes `/goal` slash command(本 skill 是 `/goal` 之上的薄包装,不是替代品)
+- ❌ 替代 Hermes `/goal` slash command(本 skill 不依赖 `/goal`,也不做它的功能——multi-story 编排与单-goal 反复跑是不同问题)
 - ❌ 替代 Kanban / openclaw-plugin-author-suite(那些是不同形状的工具)
 - ❌ 实装 git worktree 自动创建(老板使用时手动 `git worktree add`,本 skill 启动时**检测**在 worktree 内但不自动创建)
 
 ## Not verified(诚实交代)
 
-- ✅ ~~step 2 的 `goal_manager.set(goal_text, contract=contract)`~~ 在 v0.21.3 实跑过 — `scripts/test_minidemo.py` 5/5 PASSED,`goal_manager.set(goal_text, contract=contract)` 路径工作正常
-- 0 step 5 的 `delegate_task(tasks=[...])` 在**独立 python 进程**(不挂 `hermes chat`)里能否调通 —— `_init_parent_agent` 会自己 `AIAgent(...)` 构造 parent 再传,但**这条路径未在真环境验过**。`hermes ralph` CLI 模式本身**不存在**(见 §Launching the Loop)
-- 0 sub-agent 报告说 `DELEGATE_BLOCKED_TOOLS = {delegate_task, clarify, memory, send_message, cronjob_manage}`,这是从 `tools/delegate_tool_toolsets.py:14` 读出来的;但**实际的阻塞是在 child agent 收到 task 时 filter tools,不是 child 的 toolset 里没有**,这条对 worker 写 prd.json 不构成阻碍,但 precision 仍待 Phase 3 实测验
-- 0 judge LLM 的具体 token 消耗 + 主模型 judge vs Gemini Flash judge 实际质量差(per `/goal` 官方说 ~200 token,Phase 3 实测验)
-- 0 跨 priority batch 间的"等上一组全 passes=true 才开下一组"——这个 orchestrator 逻辑本 skill 自己实现,`/goal` 不管 priority。Phase 3 实测验
-- 0 `resolve_runtime_provider()` ladder 本身端到端验证 — v0.3 fix 信任 `hermes chat` ladder 2-8 的现成行为(老板 v0.21.3 实跑 `hermes chat` 通过),ralph 端单独不重测;若未来 ladder 上游变了,需重新跑 `scripts/test_minidemo.py` 验证 `_init_parent_agent` 仍能拿到完整 5 元组
+- ✅ v1.0 end-to-end smoke test 在 `examples/three-stories/` 实跑过(2026-09-18):3 story, exit 0, ALL_PASSES, ~2 分钟;产出 hello.py / goodbye.py / status.py 都符合 acceptance criteria。
+- ✅ 39/39 单元测试在 ralph/v1.0-rewrite 分支 HEAD (44b0bf2) 通过:`scripts/tests/test_starvation.py` 15/15, `scripts/tests/test_parallel.py` 24/24。
+- ✅ HermesAdapter 真接 `AIAgent.run_conversation()` 跑过(2026-09-18 在 examples/three-stories/),worker agent 通过 Read/Write/Bash 工具识别任务,自己写 prd.json 的 passes 字段。
+- ✅ `AIAgent(cwd=project_root)` 是 worker agent 拿到正确文件路径的关键(commit 44b0bf2 修了这个 bug)。
+- 0 OpenCLAWAdapter stub 还未实装(本 PRD 范围外;见 tasks/prd-ralph-goal-loop-v1.md US-013)。
+- 0 多 batch 真实跑动(目前 e2e 是 1 batch 跑完,没有验证 learnings 跨批滚雪球效果)。
+- 0 与上游 `mikeyobrien/ralph` 在同一 prd 上的 end-to-end 对比测试(per PRD US-015)。
+- 0 真-cost 估算:成本仍用模块内硬编码 `_WORKER_IN_USD_PER_1K = 0.003` / `_WORKER_OUT_USD_PER_1K = 0.015`;换模型后 `--cost-cap` 会算不准。
+- 0 `resolve_runtime_provider()` ladder 端到端:信任 `hermes chat` 现成行为,ralph 端单独没重测;未来 ladder 上游变了需重新跑测试。
